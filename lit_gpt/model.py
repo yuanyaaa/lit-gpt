@@ -210,33 +210,33 @@ class CrossAttention(nn.Module):
 
         self.attention = nn.MultiheadAttention(embd_dim, batch_first=True, num_heads=heads)
 
+    # def forward(self, x, context=None, mask=None):
+    #     assert x.shape[1] == context.shape[1]
+    #     q = self.to_q(x)
+    #     k = self.to_k(torch.cat([x, context], dim=1))
+    #     v = self.to_v(torch.cat([x, context], dim=1))
+        
+    #     attn_mask_x = (torch.triu(torch.ones(q.shape[1], q.shape[1])) == 1).transpose(0, 1).to(q.device)
+    #     attn_mask_c = (torch.eye(q.shape[1]) == 1).to(q.device)
+    #     attn_mask = torch.cat([attn_mask_x, attn_mask_c], dim=-1)
+        
+    #     attn_mask = attn_mask.float().masked_fill(attn_mask == 0, float('-inf')).masked_fill(attn_mask == 1, float(0.0))
+    #     out, _ = self.attention(q, k, v, attn_mask=attn_mask)
+        
+    #     return out
+    
     def forward(self, x, context=None, mask=None):
         assert x.shape[1] == context.shape[1]
         q = self.to_q(x)
-        k = self.to_k(torch.cat([x, context], dim=1))
-        v = self.to_v(torch.cat([x, context], dim=1))
+        k = self.to_k(context)
+        v = self.to_v(context)
         
-        attn_mask_x = (torch.triu(torch.ones(q.shape[1], q.shape[1])) == 1).transpose(0, 1).to(q.device)
-        attn_mask_c = (torch.eye(q.shape[1]) == 1).to(q.device)
-        attn_mask = torch.cat([attn_mask_x, attn_mask_c], dim=-1)
+        attn_mask = (torch.triu(torch.ones(q.shape[1], q.shape[1])) == 1).transpose(0, 1).to(q.device)
         
         attn_mask = attn_mask.float().masked_fill(attn_mask == 0, float('-inf')).masked_fill(attn_mask == 1, float(0.0))
         out, _ = self.attention(q, k, v, attn_mask=attn_mask)
         
         return out
-
-        # if exists(mask):
-        #     mask = rearrange(mask, 'b ... -> b (...)')
-        #     max_neg_value = -torch.finfo(sim.dtype).max
-        #     mask = repeat(mask, 'b j -> (b h) () j', h=h)
-        #     sim.masked_fill_(~mask, max_neg_value)
-
-        # # attention, what we cannot get enough of
-        # attn = sim.softmax(dim=-1)
-
-        # out = einsum('b i j, b j d -> b i d', attn, v)
-        # out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        # return self.to_out(out)
 
 
 class IntentionGPT(nn.Module):
@@ -250,8 +250,9 @@ class IntentionGPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
         
         self.enc_layer_num = 1
-        self.dyna_layer_num = 0
+        self.dyna_layer_num = 1
         self.dec_layer_num = config.n_layer - self.enc_layer_num - self.dyna_layer_num
+        self.hidden_num = 64
         
         # self.dec_layer_num = 1
         self.transformer_enc = nn.ModuleDict(
@@ -272,15 +273,17 @@ class IntentionGPT(nn.Module):
                 h=nn.ModuleList(Block(config) for _ in range(self.enc_layer_num)),
             )
         )
-        self.mean_layer = nn.Linear(config.n_embd, config.n_embd)
-        self.logvar_layer = nn.Linear(config.n_embd, config.n_embd)
-        self.cross_attention_layer = CrossAttention(heads=4 if config.n_embd % 4 == 0 else 1, embd_dim=config.n_embd)
+        self.mean_layer = nn.Linear(config.n_embd, self.hidden_num)
+        self.logvar_layer = nn.Linear(config.n_embd, self.hidden_num)
         
-        # self.transformer_dyna = nn.ModuleDict(
-        #     dict(
-        #         h=nn.ModuleList(Block(config) for _ in range(self.dyna_layer_num)),
-        #     )
-        # )
+        self.trans_layer = nn.Linear(self.hidden_num, config.n_embd)
+        # self.transformer_dyna = CrossAttention(heads=4 if config.n_embd % 4 == 0 else 1, embd_dim=config.n_embd)
+        
+        self.transformer_dyna = nn.ModuleDict(
+            dict(
+                h=nn.ModuleList(Block(config, attn_type='cross') for _ in range(self.dyna_layer_num)),
+            )
+        )
         
         self.transformer_dec = nn.ModuleDict(
             dict(
@@ -384,12 +387,15 @@ class IntentionGPT(nn.Module):
         # version 3
         mean, logvar = self.mean_layer(x_act), self.logvar_layer(x_act)
         mean_bc, logvar_bc = self.mean_layer(x_bc), self.logvar_layer(x_bc)
-        z = self.reparameterization(mean, logvar)
+        action = self.reparameterization(mean, logvar)
         
-        random_hidden_mask = torch.rand(z.shape[0], z.shape[1])
-        z[random_hidden_mask < self.mask_ratio] = 0
+        action = self.trans_layer(action)
+        # random_hidden_mask = torch.rand(z.shape[0], z.shape[1])
+        # z[random_hidden_mask < self.mask_ratio] = 0
         
-        x = self.cross_attention_layer(x, z)
+        for block in self.transformer_dyna.h:
+            x = block([action, x], cos, sin, mask, input_pos)
+        # x = self.cross_attention_layer(action, x)
         
         for block in self.transformer_dec.h:
             x = block(x, cos, sin, mask, input_pos)
@@ -404,7 +410,7 @@ class IntentionGPT(nn.Module):
                                  "logvar": logvar, 
                                  "mean_bc": mean_bc, 
                                  "logvar_bc": logvar_bc, 
-                                 "z": z, 
+                                 "z": action, 
                                  "entropy_mean": ent.mean(), 
                                  "entropy_std": ent.std(), 
                                  "entropy_max": ent.max(dim=-1)[0].mean(), 
@@ -578,14 +584,15 @@ class GPT(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, attn_type='self') -> None:
         super().__init__()
         self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config) if attn_type == 'self' else CausalCrossAttention(config)
         self.norm_2 = None if config.shared_attention_norm else config.norm_class(config.n_embd, eps=config.norm_eps)
         self.mlp = config.mlp_class(config)
 
         self.config = config
+        self.attn_type = attn_type
 
     def forward(
         self,
@@ -595,7 +602,11 @@ class Block(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        n_1 = self.norm_1(x)
+        if self.attn_type == 'self':
+            n_1 = self.norm_1(x)
+        else:
+            n_1 = [self.norm_1(x[0]), self.norm_2(x[1])]
+            x = x[1]
         h = self.attn(n_1, cos, sin, mask, input_pos)
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
@@ -609,6 +620,104 @@ class Block(nn.Module):
             x = h + x
             x = self.mlp(self.norm_2(x)) + x
         return x
+
+class CausalCrossAttention(nn.Module):
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        shape_q = (config.n_head) * config.head_size
+        shape_v = (2 * config.n_query_groups) * config.head_size
+        # key, query, value projections for all heads, but in a batch
+        self.attn_q = nn.Linear(config.n_embd, shape_q, bias=config.bias)
+        self.attn_kv = nn.Linear(config.n_embd, shape_v, bias=config.bias)
+        # output projection
+        self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # disabled by default
+        self.kv_cache: Optional[KVCache] = None
+
+        self.config = config
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        xq = x[0]
+        xkv = x[1]
+        
+        B, T, C = xq.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+
+        q = self.attn_q(xq)
+        q_per_kv = self.config.n_head // self.config.n_query_groups
+        kv = self.attn_kv(xkv)
+        q = q.view(B, T, self.config.n_query_groups, q_per_kv, self.config.head_size)
+        q = q.permute(0, 2, 3, 1, 4)
+        kv = kv.view(B, T, self.config.n_query_groups, 2, self.config.head_size)
+        kv = kv.permute(0, 2, 3, 1, 4)
+        k, v = kv.split((1, 1), dim=2)
+
+        # maybe repeat k and v if for the non multi-head attention cases
+        # training: flash attention requires it
+        # inference: multi-query would require a full kv cache so avoid it to limit its memory usage
+        if self.config.n_query_groups != self.config.n_head and (input_pos is None or self.config.n_query_groups != 1):
+            k = k.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
+            v = v.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
+
+        q = q.reshape(B, -1, T, self.config.head_size)  # (B, nh_q, T, hs)
+        k = k.reshape(B, -1, T, self.config.head_size)  # (B, nh_k, T, hs)
+        v = v.reshape(B, -1, T, self.config.head_size)  # (B, nh_v, T, hs)
+
+        q_roped = apply_rope(q[..., : self.config.rope_n_elem], cos, sin)
+        k_roped = apply_rope(k[..., : self.config.rope_n_elem], cos, sin)
+        q = torch.cat((q_roped, q[..., self.config.rope_n_elem :]), dim=-1)
+        k = torch.cat((k_roped, k[..., self.config.rope_n_elem :]), dim=-1)
+
+        if input_pos is not None:
+            if not isinstance(self.kv_cache, KVCache):
+                raise TypeError("You need to call `gpt.set_kv_cache()`")
+            k, v = self.kv_cache(input_pos, k, v)
+
+        y = self.scaled_dot_product_attention(q, k, v, mask)
+
+        y = y.reshape(B, T, self.config.n_embd)  # re-assemble all head outputs side by side
+
+        # output projection
+        return self.proj(y)
+
+    def scaled_dot_product_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        scale = 1.0 / math.sqrt(self.config.head_size)
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
+        )
+        return y.transpose(1, 2)
+
+    def build_kv_cache(
+        self,
+        batch_size: int,
+        max_seq_length: int,
+        rope_cache_length: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> "KVCache":
+        heads = 1 if self.config.n_query_groups == 1 else self.config.n_head
+        v_shape = (batch_size, heads, max_seq_length, self.config.head_size)
+        if rope_cache_length is None:
+            if self.config.rotary_percentage != 1.0:
+                raise TypeError("Please pass the `rope_cache_length=gpt.cos.size(-1)` value")
+            k_shape = v_shape
+        else:
+            k_shape = (
+                batch_size,
+                heads,
+                max_seq_length,
+                rope_cache_length + self.config.head_size - self.config.rope_n_elem,
+            )
+        return KVCache(k_shape, v_shape, device=device, dtype=dtype)
+
 
 
 class CausalSelfAttention(nn.Module):

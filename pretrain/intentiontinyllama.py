@@ -30,7 +30,10 @@ sys.path.append(str(wd))
 from lit_gpt.model import IntentionGPT, GPT, Block, CausalSelfAttention, Config, LLaMAMLP
 from lit_gpt.utils import CycleIterator, chunked_cross_entropy, chunked_kld, chunked_bc, compute_entropy, num_parameters
 
-beta = 20.0
+# import torch._dynamo
+# torch._dynamo.config.suppress_errors = True
+
+beta = 0.0
 # System settings
 model_name = "tiny-llama-1.1b"
 name = "lit-tiny-llama-1.1b"
@@ -213,10 +216,11 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
                 lengths=(state["iter_num"] * micro_batch_size * model.config.block_size),
             )
             metrics = {
-                "loss": loss,
+                "loss": dec_loss,
                 "loss_enc": enc_loss,
                 "loss_dec": dec_loss,
                 "loss_bc": bc_loss,
+                "loss_total": loss,
                 "value/output_entropy": entropy.item(),
                 "value/ent_mean": info['entropy_mean'].item(),
                 "value/ent_std": info['entropy_std'].item(),
@@ -311,7 +315,7 @@ def create_dataloaders(batch_size: int, block_size: int, num_workers: int = 8) -
     #     ),
     # ]
     train_datasets = StreamingDataset(
-        input_dir="data/starcoder",
+        input_dir="/data/wangpy/Research/data/starcoder",
         item_loader=TokensLoader(block_size=effective_block_size),
         shuffle=True,
         drop_last=True,
@@ -325,7 +329,7 @@ def create_dataloaders(batch_size: int, block_size: int, num_workers: int = 8) -
     )
 
     val_dataset = StreamingDataset(
-        input_dir="data/starcoder_eval",
+        input_dir="/data/wangpy/Research/data/starcoder_eval",
         item_loader=TokensLoader(block_size=effective_block_size),
         shuffle=True,
         # Consider setting to False, but we would lose some samples due to truncation when world size > 1

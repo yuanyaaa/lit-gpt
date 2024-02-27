@@ -32,7 +32,7 @@ from lit_gpt.utils import CycleIterator, chunked_cross_entropy, compute_entropy,
 
 # System settings
 model_name = "tiny-llama-1.1b"
-name = "lit-tiny-llama-1.1b"
+name = "tiny-llama-1.1b"
 out_dir = Path(os.getenv("LIGHTNING_ARTIFACTS_DIR", "out")) / name
 logger_name = "tensorboard"
 devices = torch.cuda.device_count() or 1
@@ -41,11 +41,11 @@ devices = torch.cuda.device_count() or 1
 global_batch_size = 512
 learning_rate = 4e-4
 micro_batch_size = 2
-max_tokens = int(2e10)  # 3 trillion   # 20 billion
+max_tokens = int(3e9)  # 3 trillion   # 20 billion
 warmup_steps = 2000
 log_step_interval = 1
 eval_iters = 100
-save_step_interval = 1000
+save_step_interval = 80000
 eval_step_interval = 1000
 
 weight_decay = 1e-1
@@ -201,6 +201,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             )
             metrics = {
                 "loss": loss,
+                "loss_dec": loss,
                 "iter": state["iter_num"],
                 "step": state["step_count"],
                 "value/output_entropy": entropy.item(),
@@ -282,7 +283,7 @@ def create_dataloaders(batch_size: int, block_size: int, num_workers: int = 8) -
     #     ),
     # ]
     train_datasets = StreamingDataset(
-        input_dir="data/starcoder",
+        input_dir="/data/wangpy/Research/data/starcoder",
         item_loader=TokensLoader(block_size=effective_block_size),
         shuffle=True,
         drop_last=True,
@@ -296,7 +297,7 @@ def create_dataloaders(batch_size: int, block_size: int, num_workers: int = 8) -
     )
 
     val_dataset = StreamingDataset(
-        input_dir="data/starcoder",
+        input_dir="/data/wangpy/Research/data/starcoder_eval",
         item_loader=TokensLoader(block_size=effective_block_size),
         shuffle=True,
         # Consider setting to False, but we would lose some samples due to truncation when world size > 1

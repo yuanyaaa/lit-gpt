@@ -27,27 +27,48 @@ from torchmetrics.aggregation import RunningMean
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_gpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
-from lit_gpt.utils import CycleIterator, chunked_cross_entropy, compute_entropy, num_parameters
+from lit_gpt.model import IntentionGPT, GPT, Block, CausalSelfAttention, Config, LLaMAMLP
+from lit_gpt.utils import CycleIterator, chunked_cross_entropy, chunked_kld, chunked_bc, compute_entropy, num_parameters
 
-num_layer = 44
+# import torch._dynamo
+# torch._dynamo.config.suppress_errors = True
+
+"""
+(micro=2, global 512, hybrid-shard, activation-chpt=None, ): TFLOPs: 765.85, 47.2 GB, 707.48 ms
+(micro=3, global 768, hybrid-shard, activation-chpt=None, ): TFLOPs: 1148.78, 61.0 GB, 973.72 ms * 2/3
+(micro=4, global 512, hybrid-shard, activation-chpt=None, ): TFLOPs: 1531.71, 75.4 GB, 1238.57 ms * 1/2
+(micro=4, global 512, hybrid-shard, activation-chpt=None, ): TFLOPs: 1531.71, 75.4 GB, 1238.57 ms * 1/2
+(micro=4, global 512, full-shard, activation-chpt=None, cpu-off=True): TFLOPs: 1531.71, 74.4 GB, 1238.50 ms * 1/2
+(micro=4, global 512, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 1531.71, 27.3 GB, 1814.85 ms * 1/2
+(micro=8, global 512, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 3063.41, 39.3 GB, 3663.52 ms * 1/4
+(micro=16, global 512, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 6126.82, 58.3 GB, 6580.31 ms * 1/8
+(micro=24, global 768, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 9190.23, 68.5 GB, 9724.71 ms * 1/12
+(micro=4, global 512, hybrid-shard, activation-chpt=None, gather-lim=True): TFLOPs: 1531.71, 75.4 GB, 1238.57 ms * 1/2
+(micro=4, global 512, hybrid-shard, activation-chpt=None, gather-lim=False): TFLOPs: 1531.71, 80.1 GB, 1236.20 ms * 1/2
+"""
+
+beta = 1.5
+hidden_dim = 64
 # System settings
 model_name = "tiny-llama-1.1b"
-name = "tiny-llama-1.1b" if num_layer == 22 else "tiny-llama-1.1b-layer={}".format(num_layer)
+test = False
+name = "lit-tiny-llama-1.1b-beta={}-hidden-dim={}".format(beta, hidden_dim)
+if test:
+    name = "lit-tiny-llama-1.1b-beta-test"
 out_dir = Path(os.getenv("LIGHTNING_ARTIFACTS_DIR", "out")) / name
 logger_name = "tensorboard"
 devices = torch.cuda.device_count() or 1
 
 # Hyperparameters
 global_batch_size = 512
-learning_rate = 4e-4 if num_layer == 22 else 1.6e-4
-micro_batch_size = 4
-max_tokens = int(3e9)  # 3 trillion   # 20 billion
+learning_rate = 4e-4
+micro_batch_size = 2
+max_tokens = int(3e9)  # 3 trillion  # 20 Billion
 warmup_steps = 2000
 log_step_interval = 1
 eval_iters = 100
-save_step_interval = 1000
-eval_step_interval = 1000
+save_step_interval = 500
+eval_step_interval = 500
 
 weight_decay = 1e-1
 beta1 = 0.9
@@ -69,7 +90,7 @@ hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str))
 def setup(resume: Union[bool, Path] = False):
     logger = choose_logger(logger_name, name=name, resume=resume)
 
-    strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+    strategy = FSDPStrategy(auto_wrap_policy={Block}, cpu_offload=False, limit_all_gathers=True, activation_checkpointing_policy=None, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
     fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-mixed", loggers=[logger])
     fabric.launch()
 
@@ -85,8 +106,6 @@ def main(fabric, resume):
         out_dir.mkdir(parents=True, exist_ok=True)
 
     config = Config.from_name(model_name)
-    # if num_layer > 22:
-    #     config.n_embd = 2560
 
     train_dataloader, val_dataloader = create_dataloaders(batch_size=micro_batch_size, block_size=config.block_size)
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
@@ -96,7 +115,7 @@ def main(fabric, resume):
     fabric.print(f"Loading model with {config.__dict__}")
     t0 = time.perf_counter()
     with fabric.init_module(empty_init=False):
-        model = GPT(config, num_layer=num_layer)
+        model = IntentionGPT(config, hidden_dim=hidden_dim)
         model.apply(partial(init_weights, n_layer=config.n_layer, n_embd=config.n_embd))
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
@@ -139,7 +158,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     throughput = ThroughputMonitor(fabric, window_size=5)
 
     with torch.device("meta"):
-        meta_model = GPT(model.config, num_layer=num_layer)
+        meta_model = IntentionGPT(model.config, hidden_dim=hidden_dim)
         x = torch.randint(0, 1, (micro_batch_size, meta_model.config.block_size))
         model_fwd = lambda: meta_model(x)
         model_loss = lambda y: chunked_cross_entropy(y, x, chunk_size=0)
@@ -154,8 +173,16 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     train_iterator = CycleIterator(train_dataloader)
 
     running_loss = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
+    running_loss_enc = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
+    running_loss_dec = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
+    # running_loss_bc = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
     fabric.barrier()
     total_t0 = time.perf_counter()
+    
+    if test:
+        checkpoint_path = out_dir / f"step-{0:08d}.pth"
+        fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
+        fabric.save(checkpoint_path, state)
     
     best_loss = 100000.
     for train_data in train_iterator:
@@ -174,18 +201,34 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
         targets = train_data[:, 1 : (model.config.block_size + 1)].contiguous().long()
         
         try:
+            problem = 0
             is_accumulating = state["iter_num"] % gradient_accumulation_iters != 0
             with fabric.no_backward_sync(model, enabled=is_accumulating):
-                logits = model(input_ids)
-                loss = chunked_cross_entropy(logits, targets)
+                logits, info = model(input_ids, train_mode=True)
+                enc_loss = chunked_kld(info['mean'], info['logvar'])
+                dec_loss = chunked_cross_entropy(logits, targets)
+                # bc_loss = chunked_bc(info['mean'], info['logvar'], info['mean_bc'], info['logvar_bc'])
+                loss = beta * enc_loss + dec_loss #+ bc_loss
                 fabric.backward(loss / gradient_accumulation_iters)
-                
                 entropy = compute_entropy(logits.detach())
+                
+                problem = 1
+                
+                # bc_logits, bc_info = model(input_ids.detach(), train_mode=True, action_copy=True)
+                # bc_enc_loss = chunked_kld(bc_info['mean'], bc_info['logvar'])
+                # bc_dec_loss = chunked_cross_entropy(bc_logits, targets.detach())
+                # # bc_loss = chunked_bc(info['mean'], info['logvar'], info['mean_bc'], info['logvar_bc'])
+                # bc_loss = beta * bc_enc_loss + bc_dec_loss #+ bc_loss
+                # fabric.backward(bc_loss / gradient_accumulation_iters)
+                # bc_entropy = compute_entropy(bc_logits.detach())
         except:
-            print(input_ids.shape)
+            print(input_ids.shape, problem, file=open("test.txt", "w"))
             assert 0
 
         running_loss.update(loss.detach())
+        running_loss_enc.update(enc_loss.detach())
+        running_loss_dec.update(dec_loss.detach())
+        # running_loss_bc.update(bc_loss.detach())
 
         if not is_accumulating:
             fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
@@ -195,6 +238,9 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
 
         if state["iter_num"] % log_iter_interval == 0:
             loss = running_loss.compute().item()  # expensive device-to-host synchronization
+            enc_loss = running_loss_enc.compute().item()  # expensive device-to-host synchronization
+            dec_loss = running_loss_dec.compute().item()  # expensive device-to-host synchronization
+            # bc_loss = running_loss_bc.compute().item()  # expensive device-to-host synchronization
             t1 = time.perf_counter()
             throughput.update(
                 time=(t1 - total_t0),
@@ -204,11 +250,41 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
                 lengths=(state["iter_num"] * micro_batch_size * model.config.block_size),
             )
             metrics = {
-                "loss": loss,
-                "loss_dec": loss,
+                "loss": dec_loss,
+                "loss_enc": enc_loss,
+                "loss_dec": dec_loss,
+                # "loss_bc": bc_loss,
+                "loss_total": loss,
+                "value/output_entropy": entropy.item(),
+                "value/ent_mean": info['entropy_mean'].item(),
+                "value/ent_std": info['entropy_std'].item(),
+                "value/ent_max": info['entropy_max'].item(),
+                "value/ent_min": info['entropy_min'].item(),
+                "value/mu_mean": info['mean_mean'].item(),
+                "value/mu_std": info['mean_std'].item(),
+                "value/mu_max": info['mean_max'].item(),
+                "value/mu_min": info['mean_min'].item(),
+                "value/std_mean": info['std_mean'].item(),
+                "value/std_std": info['std_std'].item(),
+                "value/std_max": info['std_max'].item(),
+                "value/std_min": info['std_min'].item(),
+                
+                # "bc_value/output_entropy": bc_entropy.item(),
+                # "bc_value/ent_mean": bc_info['entropy_mean'].item(),
+                # "bc_value/ent_std": bc_info['entropy_std'].item(),
+                # "bc_value/ent_max": bc_info['entropy_max'].item(),
+                # "bc_value/ent_min": bc_info['entropy_min'].item(),
+                # "bc_value/mu_mean": bc_info['mean_mean'].item(),
+                # "bc_value/mu_std": bc_info['mean_std'].item(),
+                # "bc_value/mu_max": bc_info['mean_max'].item(),
+                # "bc_value/mu_min": bc_info['mean_min'].item(),
+                # "bc_value/std_mean": bc_info['std_mean'].item(),
+                # "bc_value/std_std": bc_info['std_std'].item(),
+                # "bc_value/std_max": bc_info['std_max'].item(),
+                # "bc_value/std_min": bc_info['std_min'].item(),
+                
                 "iter": state["iter_num"],
                 "step": state["step_count"],
-                "value/output_entropy": entropy.item(),
                 "epoch": train_iterator.epoch,
                 "iter_time": t1 - iter_t0,
                 "remaining_time": (
@@ -220,7 +296,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             }
 
             fabric.print(
-                f"iter {metrics['iter']} | step {metrics['step']}: loss {metrics['loss']:.4f}, iter time:"
+                f"iter {metrics['iter']} | step {metrics['step']}: loss {metrics['loss']:.4f}, loss_dec {metrics['loss_dec']:.4f}, mu {metrics['value/mu_mean']:4f}, std {metrics['value/std_mean']:4f}, iter time:"
                 f" {metrics['iter_time'] * 1000:.2f} ms{' (optimizer.step),' if not is_accumulating else ','}"
                 f" remaining time: {metrics['remaining_time'] / 3600 / 24:.2f} days"
             )

@@ -30,13 +30,28 @@ sys.path.append(str(wd))
 from lit_gpt.model import IntentionGPT, GPT, Block, CausalSelfAttention, Config, LLaMAMLP
 from lit_gpt.utils import CycleIterator, chunked_cross_entropy, chunked_kld, chunked_bc, compute_entropy, num_parameters
 
-# import torch._dynamo
-# torch._dynamo.config.suppress_errors = True
 
-beta = 0.0
+"""
+(micro=2, global 512, hybrid-shard, activation-chpt=None, ): TFLOPs: 765.85, 47.2 GB, 707.48 ms
+(micro=3, global 768, hybrid-shard, activation-chpt=None, ): TFLOPs: 1148.78, 61.0 GB, 973.72 ms * 2/3
+(micro=4, global 512, hybrid-shard, activation-chpt=None, ): TFLOPs: 1531.71, 75.4 GB, 1238.57 ms * 1/2
+(micro=4, global 512, hybrid-shard, activation-chpt=None, ): TFLOPs: 1531.71, 75.4 GB, 1238.57 ms * 1/2
+(micro=4, global 512, full-shard, activation-chpt=None, cpu-off=True): TFLOPs: 1531.71, 74.4 GB, 1238.50 ms * 1/2
+(micro=4, global 512, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 1531.71, 27.3 GB, 1814.85 ms * 1/2
+(micro=8, global 512, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 3063.41, 39.3 GB, 3663.52 ms * 1/4
+(micro=16, global 512, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 6126.82, 58.3 GB, 6580.31 ms * 1/8
+(micro=24, global 768, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 9190.23, 68.5 GB, 9724.71 ms * 1/12
+(micro=4, global 512, hybrid-shard, activation-chpt=None, gather-lim=True): TFLOPs: 1531.71, 75.4 GB, 1238.57 ms * 1/2
+(micro=4, global 512, hybrid-shard, activation-chpt=None, gather-lim=False): TFLOPs: 1531.71, 80.1 GB, 1236.20 ms * 1/2
+"""
+
+beta = 1.5
+hidden_dim = 64
 # System settings
 model_name = "tiny-llama-1.1b"
-name = "lit-tiny-llama-1.1b"
+test = False
+name = "lit-tiny-llama-1.1b-beta={}-hidden-dim={}".format(beta, hidden_dim)
+# name = "lit-tiny-llama-1.1b-beta-test"
 out_dir = Path(os.getenv("LIGHTNING_ARTIFACTS_DIR", "out")) / name
 logger_name = "tensorboard"
 devices = torch.cuda.device_count() or 1
@@ -44,13 +59,13 @@ devices = torch.cuda.device_count() or 1
 # Hyperparameters
 global_batch_size = 512
 learning_rate = 4e-4
-micro_batch_size = 2
+micro_batch_size = 4
 max_tokens = int(3e9)  # 3 trillion  # 20 Billion
 warmup_steps = 2000
 log_step_interval = 1
 eval_iters = 100
-save_step_interval = 80000
-eval_step_interval = 1000
+save_step_interval = 500
+eval_step_interval = 500
 
 weight_decay = 1e-1
 beta1 = 0.9
@@ -72,7 +87,7 @@ hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str))
 def setup(resume: Union[bool, Path] = False):
     logger = choose_logger(logger_name, name=name, resume=resume)
 
-    strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+    strategy = FSDPStrategy(auto_wrap_policy={Block}, cpu_offload=True, limit_all_gathers=True, activation_checkpointing_policy=None, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
     fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-mixed", loggers=[logger])
     fabric.launch()
 
@@ -97,7 +112,7 @@ def main(fabric, resume):
     fabric.print(f"Loading model with {config.__dict__}")
     t0 = time.perf_counter()
     with fabric.init_module(empty_init=False):
-        model = IntentionGPT(config)
+        model = IntentionGPT(config, hidden_dim=hidden_dim)
         model.apply(partial(init_weights, n_layer=config.n_layer, n_embd=config.n_embd))
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
@@ -106,7 +121,7 @@ def main(fabric, resume):
     model = torch.compile(model)
     model = fabric.setup(model)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), fused=True
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), fused=False
     )
     optimizer = fabric.setup_optimizers(optimizer)
 
@@ -140,7 +155,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     throughput = ThroughputMonitor(fabric, window_size=5)
 
     with torch.device("meta"):
-        meta_model = IntentionGPT(model.config)
+        meta_model = IntentionGPT(model.config, hidden_dim=hidden_dim)
         x = torch.randint(0, 1, (micro_batch_size, meta_model.config.block_size))
         model_fwd = lambda: meta_model(x)
         model_loss = lambda y: chunked_cross_entropy(y, x, chunk_size=0)
@@ -157,10 +172,16 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     running_loss = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
     running_loss_enc = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
     running_loss_dec = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
-    running_loss_bc = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
+    # running_loss_bc = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
     fabric.barrier()
     total_t0 = time.perf_counter()
-
+    
+    if test:
+        checkpoint_path = out_dir / f"step-{0:08d}.pth"
+        fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
+        fabric.save(checkpoint_path, state)
+    
+    best_loss = 100000.
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
             break
@@ -182,8 +203,8 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
                 logits, info = model(input_ids, train_mode=True)
                 enc_loss = chunked_kld(info['mean'], info['logvar'])
                 dec_loss = chunked_cross_entropy(logits, targets)
-                bc_loss = chunked_bc(info['mean'], info['logvar'], info['mean_bc'], info['logvar_bc'])
-                loss = beta * enc_loss + dec_loss + bc_loss
+                # bc_loss = chunked_bc(info['mean'], info['logvar'], info['mean_bc'], info['logvar_bc'])
+                loss = beta * enc_loss + dec_loss #+ bc_loss
                 fabric.backward(loss / gradient_accumulation_iters)
                 
                 entropy = compute_entropy(logits.detach())
@@ -194,7 +215,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
         running_loss.update(loss.detach())
         running_loss_enc.update(enc_loss.detach())
         running_loss_dec.update(dec_loss.detach())
-        running_loss_bc.update(bc_loss.detach())
+        # running_loss_bc.update(bc_loss.detach())
 
         if not is_accumulating:
             fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
@@ -206,7 +227,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             loss = running_loss.compute().item()  # expensive device-to-host synchronization
             enc_loss = running_loss_enc.compute().item()  # expensive device-to-host synchronization
             dec_loss = running_loss_dec.compute().item()  # expensive device-to-host synchronization
-            bc_loss = running_loss_bc.compute().item()  # expensive device-to-host synchronization
+            # bc_loss = running_loss_bc.compute().item()  # expensive device-to-host synchronization
             t1 = time.perf_counter()
             throughput.update(
                 time=(t1 - total_t0),
@@ -219,7 +240,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
                 "loss": dec_loss,
                 "loss_enc": enc_loss,
                 "loss_dec": dec_loss,
-                "loss_bc": bc_loss,
+                # "loss_bc": bc_loss,
                 "loss_total": loss,
                 "value/output_entropy": entropy.item(),
                 "value/ent_mean": info['entropy_mean'].item(),
@@ -262,6 +283,9 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             val_loss = validate(fabric, model, val_dataloader, max_iters=eval_iters)
             val_loss = val_loss.item()
             td = time.perf_counter() - t0
+            
+            if val_loss < best_loss:
+                best_loss = val_loss
 
             fabric.print(f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
             metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
@@ -315,7 +339,8 @@ def create_dataloaders(batch_size: int, block_size: int, num_workers: int = 8) -
     #     ),
     # ]
     train_datasets = StreamingDataset(
-        input_dir="/data/wangpy/Research/data/starcoder",
+        # input_dir="/data/wangpy/Research/data/starcoder",
+        input_dir="/data/scz3286/lit-gpt/data/starcoder",
         item_loader=TokensLoader(block_size=effective_block_size),
         shuffle=True,
         drop_last=True,
@@ -329,7 +354,8 @@ def create_dataloaders(batch_size: int, block_size: int, num_workers: int = 8) -
     )
 
     val_dataset = StreamingDataset(
-        input_dir="/data/wangpy/Research/data/starcoder_eval",
+        # input_dir="/data/wangpy/Research/data/starcoder_eval",
+        input_dir="/data/scz3286/lit-gpt/data/starcoder_eval",
         item_loader=TokensLoader(block_size=effective_block_size),
         shuffle=True,
         # Consider setting to False, but we would lose some samples due to truncation when world size > 1

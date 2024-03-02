@@ -41,21 +41,25 @@ def sample(logits: torch.Tensor, temperature: float = 1.0, top_k: Optional[int] 
     return torch.argmax(logits, dim=-1, keepdim=True)
 
 
-def next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-    logits = model(x, input_pos)
+def next_token(model, input_pos: torch.Tensor, x: torch.Tensor, action_bias: float, **kwargs: Any) -> torch.Tensor:
+    if type(action_bias) == bool and not action_bias:
+        logits = model(x, input_pos)
+    else:
+        logits = model(x, input_pos, action_bias=action_bias)
     next = sample(logits, **kwargs)
     return next.to(dtype=x.dtype)
 
 
 @torch.inference_mode()
-def generate(
-    model: GPT,
+def generate_with_actions(
+    model,
     prompt: torch.Tensor,
     max_returned_tokens: int,
     *,
-    temperature: float = 1.0,
+    temperature: float = 0.01,
     top_k: Optional[int] = None,
     eos_id: Optional[int] = None,
+    action_bias: torch.Tensor = None,
 ) -> torch.Tensor:
     """Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
 
@@ -80,17 +84,114 @@ def generate(
     device = prompt.device
     tokens = [prompt]
     input_pos = torch.tensor([T], device=device)
+    # print("Model shape", )
     token = next_token(
-        model, torch.arange(0, T, device=device), prompt.view(1, -1), temperature=temperature, top_k=top_k
+        model, torch.arange(0, T, device=device), prompt.view(1, -1), action_bias=action_bias[:, :T], temperature=temperature, top_k=top_k
     ).clone()
     tokens.append(token)
-    for _ in range(2, max_returned_tokens - T + 1):
-        token = next_token(model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k).clone()
-        tokens.append(token)
+    # print(token)
+    for idx in range(1, max_returned_tokens - T):
+        token = next_token(model, torch.arange(0, T+idx, device=device), torch.cat(tokens).int().view(1, -1), action_bias=action_bias[:, :T+idx], temperature=temperature, top_k=top_k).clone()
+        tokens.append(token[-1:])
         if token == eos_id:
             break
         input_pos = input_pos.add_(1)
     return torch.cat(tokens)
+
+@torch.inference_mode()
+def generate(
+    model,
+    prompt: torch.Tensor,
+    max_returned_tokens: int,
+    *,
+    temperature: float = 0.01,
+    top_k: Optional[int] = None,
+    eos_id: Optional[int] = None,
+    action_bias: float =0,
+) -> torch.Tensor:
+    """Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
+
+    The implementation of this function is modified from A. Karpathy's nanoGPT.
+
+    Args:
+        model: The model to use.
+        prompt: Tensor of shape (T) with indices of the prompt sequence.
+        max_returned_tokens: The maximum number of tokens to return (given plus generated).
+        temperature: Scales the predicted logits by 1 / temperature.
+        top_k: If specified, only sample among the tokens with the k highest probabilities.
+        eos_id: If specified, stop generating any more token once the <eos> token is triggered.
+    """
+    T = prompt.size(0)
+    assert max_returned_tokens > T
+    if model.max_seq_length < max_returned_tokens - 1:
+        # rolling the kv cache based on the `input_pos` value would be necessary. However, doing so would introduce a
+        # data dependency on the `input_pos` tensor and impact model compilation. Since this setting is uncommon, we do
+        # not support it to avoid negatively impacting the overall speed
+        raise NotImplementedError(f"max_seq_length {model.max_seq_length} needs to be >= {max_returned_tokens - 1}")
+
+    device = prompt.device
+    tokens = [prompt]
+    input_pos = torch.tensor([T], device=device)
+    # print("Model shape", )
+    token = next_token(
+        model, torch.arange(0, T, device=device), prompt.view(1, -1), action_bias=False, temperature=temperature, top_k=top_k
+    ).clone()
+    tokens.append(token)
+    # print(token)
+    for idx in range(1, max_returned_tokens - T):
+        token = next_token(model, torch.arange(0, T+idx, device=device), torch.cat(tokens).int().view(1, -1), action_bias=False, temperature=temperature, top_k=top_k).clone()
+        tokens.append(token[-1:])
+        if token == eos_id:
+            break
+        input_pos = input_pos.add_(1)
+    return torch.cat(tokens)
+
+# @torch.inference_mode()
+# def generate(
+#     model,
+#     prompt: torch.Tensor,
+#     max_returned_tokens: int,
+#     *,
+#     temperature: float = 1.0,
+#     top_k: Optional[int] = None,
+#     eos_id: Optional[int] = None,
+#     action_bias: float =0,
+# ) -> torch.Tensor:
+#     """Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
+
+#     The implementation of this function is modified from A. Karpathy's nanoGPT.
+
+#     Args:
+#         model: The model to use.
+#         prompt: Tensor of shape (T) with indices of the prompt sequence.
+#         max_returned_tokens: The maximum number of tokens to return (given plus generated).
+#         temperature: Scales the predicted logits by 1 / temperature.
+#         top_k: If specified, only sample among the tokens with the k highest probabilities.
+#         eos_id: If specified, stop generating any more token once the <eos> token is triggered.
+#     """
+#     T = prompt.size(0)
+#     assert max_returned_tokens > T
+#     if model.max_seq_length < max_returned_tokens - 1:
+#         # rolling the kv cache based on the `input_pos` value would be necessary. However, doing so would introduce a
+#         # data dependency on the `input_pos` tensor and impact model compilation. Since this setting is uncommon, we do
+#         # not support it to avoid negatively impacting the overall speed
+#         raise NotImplementedError(f"max_seq_length {model.max_seq_length} needs to be >= {max_returned_tokens - 1}")
+
+#     device = prompt.device
+#     tokens = [prompt]
+#     input_pos = torch.tensor([T], device=device)
+#     # print("Model shape", )
+#     token = next_token(
+#         model, torch.arange(0, T, device=device), prompt.view(1, -1), action_bias=action_bias, temperature=temperature, top_k=top_k
+#     ).clone()
+#     tokens.append(token)
+#     for _ in range(2, max_returned_tokens - T + 1):
+#         token = next_token(model, input_pos, token.view(1, -1), action_bias=action_bias, temperature=temperature, top_k=top_k).clone()
+#         tokens.append(token)
+#         if token == eos_id:
+#             break
+#         input_pos = input_pos.add_(1)
+#     return torch.cat(tokens)
 
 
 @torch.inference_mode()

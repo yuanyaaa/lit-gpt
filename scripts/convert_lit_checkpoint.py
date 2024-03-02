@@ -15,7 +15,7 @@ sys.path.append(str(wd))
 
 from lit_gpt import Config
 from lit_gpt.utils import incremental_save, lazy_load
-from scripts.convert_hf_checkpoint import layer_template, load_param
+# from scripts.convert_hf_checkpoint import layer_template, load_param
 
 
 def copy_weights_falcon(
@@ -98,6 +98,106 @@ def copy_weights_gpt_neox(
         state_dict[to_name] = param
 
 
+
+def copy_weights_intention(
+    config: Config,
+    state_dict: Dict[str, torch.Tensor],
+    lit_weights: Dict[str, Union[torch.Tensor, NotYetLoadedTensor]],
+    saver: Optional[incremental_save] = None,
+) -> None:
+    weight_map = {
+        "transformer_dec.wte.weight": "model.embed_tokens.weight",
+        "transformer_dec.h.{}.norm_1.weight": "model.layers.{l}.input_layernorm.weight",
+        "transformer_dec.h.{}.norm_1.bias": "model.layers.{l}.input_layernorm.bias",
+        "transformer_dec.h.{}.attn.proj.weight": "model.layers.{l}.self_attn.o_proj.weight",
+        "transformer_dec.h.{}.norm_2.weight": "model.layers.{l}.post_attention_layernorm.weight",
+        "transformer_dec.h.{}.norm_2.bias": "model.layers.{l}.post_attention_layernorm.bias",
+        "transformer_dec.ln_f.weight": "model.norm.weight",
+        "transformer_dec.ln_f.bias": "model.norm.bias",
+        
+        "transformer_enc.h.{}.norm_1.weight": "model.layers.{l}.input_layernorm.weight",
+        "transformer_enc.h.{}.norm_1.bias": "model.layers.{l}.input_layernorm.bias",
+        "transformer_enc.h.{}.attn.proj.weight": "model.layers.{l}.self_attn.o_proj.weight",
+        "transformer_enc.h.{}.norm_2.weight": "model.layers.{l}.post_attention_layernorm.weight",
+        "transformer_enc.h.{}.norm_2.bias": "model.layers.{l}.post_attention_layernorm.bias",
+        
+        "transformer_bc.h.{}.norm_1.weight": "model.layers.{l}.input_layernorm.weight",
+        "transformer_bc.h.{}.norm_1.bias": "model.layers.{l}.input_layernorm.bias",
+        "transformer_bc.h.{}.attn.proj.weight": "model.layers.{l}.self_attn.o_proj.weight",
+        "transformer_bc.h.{}.norm_2.weight": "model.layers.{l}.post_attention_layernorm.weight",
+        "transformer_bc.h.{}.norm_2.bias": "model.layers.{l}.post_attention_layernorm.bias",
+        
+        "lm_head.weight": "lm_head.weight",
+        "mean_layer.weight": "mean_layer.weight",
+        "logvar_layer.weight": "logvar_layer.weight",
+        "trans_layer.weight": "trans_layer.weight",
+    }
+    if config._mlp_class == "LLaMAMoE":
+        weight_map.update({
+            "transformer_enc.h.{}.mlp.gate.weight": "model.layers.{l}.block_sparse_moe.gate.weight",
+            "transformer_enc.h.{}.mlp.experts.{}.fc_1.weight": "model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight",
+            "transformer_enc.h.{}.mlp.experts.{}.fc_2.weight": "model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight",
+            "transformer_enc.h.{}.mlp.experts.{}.proj.weight": "model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight",
+            
+            "transformer_dec.h.{}.mlp.gate.weight": "model.layers.{l}.block_sparse_moe.gate.weight",
+            "transformer_dec.h.{}.mlp.experts.{}.fc_1.weight": "model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight",
+            "transformer_dec.h.{}.mlp.experts.{}.fc_2.weight": "model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight",
+            "transformer_dec.h.{}.mlp.experts.{}.proj.weight": "model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight",
+            
+            "transformer_bc.h.{}.mlp.gate.weight": "model.layers.{l}.block_sparse_moe.gate.weight",
+            "transformer_bc.h.{}.mlp.experts.{}.fc_1.weight": "model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight",
+            "transformer_bc.h.{}.mlp.experts.{}.fc_2.weight": "model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight",
+            "transformer_bc.h.{}.mlp.experts.{}.proj.weight": "model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight",
+        })
+    elif config._mlp_class == "LLaMAMLP":
+        weight_map.update({
+            "transformer_enc.h.{}.mlp.fc_1.weight": "model.layers.{l}.mlp.gate_proj.weight",
+            "transformer_enc.h.{}.mlp.fc_2.weight": "model.layers.{l}.mlp.up_proj.weight",
+            "transformer_enc.h.{}.mlp.proj.weight": "model.layers.{l}.mlp.down_proj.weight",
+            
+            "transformer_dec.h.{}.mlp.fc_1.weight": "model.layers.{l}.mlp.gate_proj.weight",
+            "transformer_dec.h.{}.mlp.fc_2.weight": "model.layers.{l}.mlp.up_proj.weight",
+            "transformer_dec.h.{}.mlp.proj.weight": "model.layers.{l}.mlp.down_proj.weight",
+            
+            "transformer_bc.h.{}.mlp.fc_1.weight": "model.layers.{l}.mlp.gate_proj.weight",
+            "transformer_bc.h.{}.mlp.fc_2.weight": "model.layers.{l}.mlp.up_proj.weight",
+            "transformer_bc.h.{}.mlp.proj.weight": "model.layers.{l}.mlp.down_proj.weight",
+        })
+    else:
+        raise NotImplementedError
+
+    for name, param in lit_weights.items():
+        if name.startswith("_orig_mod."):
+            name = name[10:]
+        print(name)
+        
+        if name.endswith(".attn.attn.weight"):
+            from_name, l = layer_template(name, 2)
+            q = "model.layers.{}.self_attn.q_proj.weight".format(l)
+            k = "model.layers.{}.self_attn.k_proj.weight".format(l)
+            v = "model.layers.{}.self_attn.v_proj.weight".format(l)
+            qkv = load_param(param, name, None)
+            qp, kp, vp = qkv_split(qkv, config)
+            for to_name, param in zip((q, k, v), (qp, kp, vp)):
+                if saver is not None:
+                    param = saver.store_early(param)
+                state_dict[to_name] = param
+        else:
+            if "transformer_bc.h" in name or "transformer_enc.h" in name or "transformer_dec.h" in name:
+                from_name, l = layer_template(name, 2)
+                e = None
+                if "mlp.experts" in name:
+                    from_name, e = layer_template(from_name, 5)
+                to_name = weight_map[from_name]
+                to_name = to_name.format(l=l, e=e)
+            else:
+                to_name = weight_map[name]
+            param = load_param(param, name, None)
+            if saver is not None:
+                param = saver.store_early(param)
+            state_dict[to_name] = param
+
+
 def copy_weights_llama(
     config: Config,
     state_dict: Dict[str, torch.Tensor],
@@ -132,6 +232,9 @@ def copy_weights_llama(
         raise NotImplementedError
 
     for name, param in lit_weights.items():
+        if name.startswith("_orig_mod."):
+            name = name[10:]
+        
         if name.endswith(".attn.attn.weight"):
             from_name, l = layer_template(name, 2)
             q = "model.layers.{}.self_attn.q_proj.weight".format(l)
@@ -233,8 +336,28 @@ def check_conversion_supported(lit_weights: Dict[str, torch.Tensor]) -> None:
 
 
 @torch.inference_mode()
-def convert_lit_checkpoint(checkpoint_path: Path, output_path: Path, config_path: Path) -> None:
-    config = Config.from_json(config_path)
+def convert_lit_checkpoint(checkpoint_path: Path, output_path: Path) -> None:
+    model_name = "tiny-llama-1.1b"
+    config = Config.from_name(model_name)
+    # config = Config.from_json(config_path)
+    
+    copy_fn = partial(copy_weights_intention, config)
+
+    # initialize a new empty state dict to hold our new weights
+    sd = {}
+    with incremental_save(output_path) as saver:
+        lit_weights = lazy_load(checkpoint_path)
+        lit_weights = lit_weights.get("model", lit_weights)
+        check_conversion_supported(lit_weights)
+        copy_fn(sd, lit_weights, saver=saver)
+        gc.collect()
+        saver.save(sd)
+
+@torch.inference_mode()
+def convert_tiny_checkpoint(checkpoint_path: Path, output_path: Path) -> None:
+    model_name = "tiny-llama-1.1b"
+    config = Config.from_name(model_name)
+    # config = Config.from_json(config_path)
 
     if "falcon" in config.name:
         copy_fn = partial(copy_weights_falcon, config.name)
@@ -254,6 +377,24 @@ def convert_lit_checkpoint(checkpoint_path: Path, output_path: Path, config_path
         copy_fn(sd, lit_weights, saver=saver)
         gc.collect()
         saver.save(sd)
+
+def layer_template(layer_name: str, idx: int) -> Tuple[str, int]:
+    split = layer_name.split(".")
+    number = int(split[idx])
+    split[idx] = "{}"
+    from_name = ".".join(split)
+    return from_name, number
+
+
+def load_param(param: Union[torch.Tensor, NotYetLoadedTensor], name: str, dtype: Optional[torch.dtype]) -> torch.Tensor:
+    if hasattr(param, "_load_tensor"):
+        # support tensors loaded via `lazy_load()`
+        print(f"Loading {name!r} into RAM")
+        param = param._load_tensor()
+    if dtype is not None and type(dtype) is not NotYetLoadedTensor and dtype != param.dtype:
+        print(f"Converting {name!r} from {param.dtype} to {dtype}")
+        param = param.to(dtype)
+    return param
 
 
 if __name__ == "__main__":

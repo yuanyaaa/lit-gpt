@@ -12,6 +12,7 @@ import time
 from functools import partial
 from pathlib import Path
 from typing import Tuple, Union
+from tqdm import tqdm
 
 import lightning as L
 import torch
@@ -48,7 +49,7 @@ from lit_gpt.utils import CycleIterator, chunked_cross_entropy, chunked_kld, chu
 """
 
 beta = 1.5
-hidden_dim = 32
+hidden_dim = 64
 # System settings
 model_name = "tiny-llama-1.1b"
 test = False
@@ -60,9 +61,9 @@ logger_name = "tensorboard"
 devices = torch.cuda.device_count() or 1
 
 # Hyperparameters
-global_batch_size = 512
-learning_rate = 1e-4
-micro_batch_size = 4
+global_batch_size = 2048
+learning_rate = 2e-4
+micro_batch_size = 64
 max_tokens = int(20e9)  # 3 trillion  # 20 Billion
 warmup_steps = 2000
 log_step_interval = 1
@@ -111,10 +112,10 @@ def mail(name="", msg=""):
     return ret
 
 
-def setup(resume: Union[bool, Path] = False):
+def setup(resume: Union[bool, Path] = True):
     logger = choose_logger(logger_name, name=name, resume=resume)
 
-    strategy = FSDPStrategy(auto_wrap_policy={Block}, cpu_offload=False, limit_all_gathers=True, activation_checkpointing_policy={Block}, state_dict_type="full", sharding_strategy="FULL_SHARD")
+    strategy = FSDPStrategy(auto_wrap_policy={Block}, cpu_offload=False, limit_all_gathers=True, activation_checkpointing_policy=None, state_dict_type="full", sharding_strategy="FULL_SHARD")
     fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-mixed", loggers=[logger])
     fabric.launch()
 
@@ -180,7 +181,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     model = state["model"]
     optimizer = state["optimizer"]
 
-    validate(fabric, model, val_dataloader, max_iters=2)  # sanity check
+    # validate(fabric, model, val_dataloader, max_iters=2)  # sanity check
     throughput = ThroughputMonitor(fabric, window_size=5)
 
     with torch.device("meta"):
@@ -221,10 +222,10 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     best_loss = 100000.
     grad_before = None
     grad_after = None
-    for train_data in train_iterator:
-        if state["iter_num"] >= max_iters:
-            break
-
+    
+    action_max = None
+    action_min = None
+    for train_data in tqdm(train_iterator):
         # determine and set the learning rate for this iteration
         lr = get_lr(state["iter_num"], warmup_iters, max_iters) if decay_lr else learning_rate
         for param_group in optimizer.param_groups:
@@ -232,154 +233,37 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
 
         state["iter_num"] += 1
         iter_t0 = time.perf_counter()
-
         input_ids = train_data[:, 0 : model.config.block_size].contiguous().long()
-        targets = train_data[:, 1 : (model.config.block_size + 1)].contiguous().long()
         
         try:
             problem = 0
             is_accumulating = state["iter_num"] % gradient_accumulation_iters != 0
             with fabric.no_backward_sync(model, enabled=is_accumulating):
-                logits, info = model(input_ids, train_mode=True)
-                enc_loss = chunked_kld(info['mean'], info['logvar'])
-                dec_loss = chunked_cross_entropy(logits, targets)
-                # bc_loss = chunked_bc(info['mean'], info['logvar'], info['mean_bc'], info['logvar_bc'])
-                loss = beta * enc_loss + dec_loss #+ bc_loss
-                fabric.backward(loss / gradient_accumulation_iters)
-                entropy = compute_entropy(logits.detach())
+                with torch.no_grad():
+                    action = model(input_ids, train_mode=True, action_only=True)
                 
-                # problem = 1
-                # bc_logits, bc_info = model(input_ids.detach(), train_mode=True, action_copy=True)
-                # bc_enc_loss = chunked_kld(bc_info['mean'], bc_info['logvar'])
-                # bc_dec_loss = chunked_cross_entropy(bc_logits, targets.detach())
-                # # bc_loss = chunked_bc(info['mean'], info['logvar'], info['mean_bc'], info['logvar_bc'])
-                # bc_loss = beta * bc_enc_loss + bc_dec_loss #+ bc_loss
-                # fabric.backward(bc_loss / gradient_accumulation_iters)
-                # bc_entropy = compute_entropy(bc_logits.detach())
+                action_max_batch = action.reshape(-1, action.shape[-1]).max(dim=0, keepdim=False)[0]
+                action_min_batch = action.reshape(-1, action.shape[-1]).min(dim=0, keepdim=False)[0]
+                if action_max is None:
+                    action_max = action_max_batch
+                else:
+                    action_max = torch.max(action_max, action_max_batch)
+                    
+                if action_min is None:
+                    action_min = action_min_batch
+                else:
+                    action_min = torch.max(action_min, action_min_batch)
+                
+                if state["iter_num"] % 100 == 0:
+                    print({"max": action_max.detach().cpu().numpy(), "min": action_min.detach().cpu().numpy()})
+                    print({"max": action_max.detach().cpu().numpy(), "min": action_min.detach().cpu().numpy()}, file=open("action_bound_iter.txt", "w"))
+                
         except:
             print(input_ids.shape, problem, file=open("test.txt", "w"))
             mail(name=name, msg="experiments killed at {}".format(str(state["iter_num"])))
             assert 0
+    print({"max": action_max.detach().cpu().numpy(), "min": action_min.detach().cpu().numpy()}, file=open("action_bound.txt", "w"))
 
-        running_loss.update(loss.detach())
-        running_loss_enc.update(enc_loss.detach())
-        running_loss_dec.update(dec_loss.detach())
-        # running_loss_bc.update(bc_loss.detach())
-
-        if not is_accumulating:
-            grad_before = 0.
-            for params in model.parameters():
-                grad = params.grad
-                if grad is not None:
-                    grad_before += (grad ** 2).mean().item()
-            
-            fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
-            
-            grad_after = 0.
-            for params in model.parameters():
-                grad = params.grad
-                if grad is not None:
-                    grad_after += (grad ** 2).mean().item()
-            
-            optimizer.step()
-            optimizer.zero_grad()
-            state["step_count"] += 1
-
-        if state["iter_num"] % log_iter_interval == 0:
-            loss = running_loss.compute().item()  # expensive device-to-host synchronization
-            enc_loss = running_loss_enc.compute().item()  # expensive device-to-host synchronization
-            dec_loss = running_loss_dec.compute().item()  # expensive device-to-host synchronization
-            # bc_loss = running_loss_bc.compute().item()  # expensive device-to-host synchronization
-            t1 = time.perf_counter()
-            throughput.update(
-                time=(t1 - total_t0),
-                flops=(measured_flops * log_iter_interval),
-                batches=state["iter_num"],
-                samples=(state["iter_num"] * micro_batch_size),
-                lengths=(state["iter_num"] * micro_batch_size * model.config.block_size),
-            )
-            metrics = {
-                "loss": dec_loss,
-                "loss_enc": enc_loss,
-                "loss_dec": dec_loss,
-                # "loss_bc": bc_loss,
-                "loss_total": loss,
-                "value/output_entropy": entropy.item(),
-                "value/ent_mean": info['entropy_mean'].item(),
-                "value/ent_std": info['entropy_std'].item(),
-                "value/ent_max": info['entropy_max'].item(),
-                "value/ent_min": info['entropy_min'].item(),
-                "value/mu_mean": info['mean_mean'].item(),
-                "value/mu_std": info['mean_std'].item(),
-                "value/mu_max": info['mean_max'].item(),
-                "value/mu_min": info['mean_min'].item(),
-                "value/std_mean": info['std_mean'].item(),
-                "value/std_std": info['std_std'].item(),
-                "value/std_max": info['std_max'].item(),
-                "value/std_min": info['std_min'].item(),
-                
-                "grad/grad_before": grad_before if grad_before is not None else 0.,
-                "grad/grad_after": grad_after if grad_after is not None else 0.,
-                
-                # "bc_value/output_entropy": bc_entropy.item(),
-                # "bc_value/ent_mean": bc_info['entropy_mean'].item(),
-                # "bc_value/ent_std": bc_info['entropy_std'].item(),
-                # "bc_value/ent_max": bc_info['entropy_max'].item(),
-                # "bc_value/ent_min": bc_info['entropy_min'].item(),
-                # "bc_value/mu_mean": bc_info['mean_mean'].item(),
-                # "bc_value/mu_std": bc_info['mean_std'].item(),
-                # "bc_value/mu_max": bc_info['mean_max'].item(),
-                # "bc_value/mu_min": bc_info['mean_min'].item(),
-                # "bc_value/std_mean": bc_info['std_mean'].item(),
-                # "bc_value/std_std": bc_info['std_std'].item(),
-                # "bc_value/std_max": bc_info['std_max'].item(),
-                # "bc_value/std_min": bc_info['std_min'].item(),
-                
-                "iter": state["iter_num"],
-                "step": state["step_count"],
-                "epoch": train_iterator.epoch,
-                "iter_time": t1 - iter_t0,
-                "remaining_time": (
-                    (t1 - total_t0) / (state["iter_num"] - initial_iter) * (max_iters - state["iter_num"])
-                ),
-                "tokens": state["iter_num"] * micro_batch_size * model.config.block_size,
-                "total_tokens": state["iter_num"] * micro_batch_size * model.config.block_size * fabric.world_size,
-                "learning_rate": lr,
-            }
-
-            fabric.print(
-                f"iter {metrics['iter']} | step {metrics['step']}: loss {metrics['loss']:.4f}, loss_dec {metrics['loss_dec']:.4f}, mu {metrics['value/mu_mean']:4f}, std {metrics['value/std_mean']:4f}, iter time:"
-                f" {metrics['iter_time'] * 1000:.2f} ms{' (optimizer.step),' if not is_accumulating else ','}"
-                f" remaining time: {metrics['remaining_time'] / 3600 / 24:.2f} days"
-            )
-
-            throughput_metrics = throughput.compute()
-            metrics.update(throughput_metrics)
-            fabric.log_dict(metrics, step=state["iter_num"])
-
-        if val_dataloader is not None and not is_accumulating and state["step_count"] % eval_step_interval == 0:
-            t0 = time.perf_counter()
-            val_loss = validate(fabric, model, val_dataloader, max_iters=eval_iters)
-            val_loss = val_loss.item()
-            td = time.perf_counter() - t0
-            
-            if val_loss < best_loss:
-                best_loss = val_loss
-
-            fabric.print(f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
-            metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
-            fabric.log_dict(metrics, step=state["iter_num"])
-            fabric.barrier()
-            
-        try:
-            if not is_accumulating and state["step_count"] % save_step_interval == 0:
-                checkpoint_path = out_dir / f"step-{state['step_count']:08d}-vae.pth"
-                fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
-                mail(name=name, msg="new model saved at {}, val loss {}, step {}, best loss {}".format(state["iter_num"], val_loss, state["step_count"], best_loss))
-                fabric.save(checkpoint_path, state)
-        except:
-            mail(name=name, msg="new model saving failed at {}, val loss {}, step {}, best loss {}".format(state["iter_num"], val_loss, state["step_count"], best_loss))
-            assert 0
 
 @torch.no_grad()
 def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max_iters: int) -> torch.Tensor:

@@ -38,12 +38,12 @@ from lit_gpt.utils import CycleIterator, chunked_cross_entropy, chunked_kld, chu
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
-beta = 0.5
-hidden_dim = 32
+beta = 1.5
+hidden_dim = 64
 # System settings
 model_name = "tiny-llama-1.1b"
 name = "lit-tiny-llama-1.1b-beta={}-hidden-dim={}".format(beta, hidden_dim)
-name = "lit-tiny-llama-1.1b"
+name = "tiny-llama-1.1b"
 out_dir = Path(os.getenv("LIGHTNING_ARTIFACTS_DIR", "out")) / name
 logger_name = "tensorboard"
 devices = torch.cuda.device_count() or 1
@@ -128,6 +128,7 @@ def main(fabric, resume):
 
     if resume is True:
         resume = max(out_dir.glob("*.pth"), key=(lambda p: int(p.name.split("-")[1])))
+        print("Test", resume)
     if resume:
         fabric.print(f"Resuming training from {resume}")
         fabric.load(resume, state)

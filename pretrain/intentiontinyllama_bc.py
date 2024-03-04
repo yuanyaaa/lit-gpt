@@ -27,7 +27,7 @@ from torchmetrics.aggregation import RunningMean
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_gpt.model import IntentionGPT, GPT, Block, CausalSelfAttention, Config, LLaMAMLP
+from lit_gpt.model import IntentionGPT, GPT, Block, CausalSelfAttention, Config, LLaMAMLP, mark_only_policy_as_trainable
 from lit_gpt.utils import CycleIterator, chunked_cross_entropy, chunked_kld, chunked_bc, compute_entropy, num_parameters
 
 # import torch._dynamo
@@ -61,14 +61,14 @@ devices = torch.cuda.device_count() or 1
 
 # Hyperparameters
 global_batch_size = 512
-learning_rate = 4e-4
-micro_batch_size = 2
-max_tokens = int(3e9)  # 3 trillion  # 20 Billion
+learning_rate = 1e-4
+micro_batch_size = 4
+max_tokens = int(20e9)  # 3 trillion  # 20 Billion
 warmup_steps = 2000
 log_step_interval = 1
 eval_iters = 100
 save_step_interval = 500
-eval_step_interval = 500
+eval_step_interval = 100
 
 weight_decay = 1e-1
 beta1 = 0.9
@@ -86,11 +86,35 @@ log_iter_interval = log_step_interval * gradient_accumulation_iters
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 
+def mail(name="", msg=""):
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.utils import formataddr
+    my_sender='aid0214@163.com'    # 发件人邮箱账号
+    my_pass = 'MCJHFHOXVODVRAVV'              # 发件人邮箱密码
+    my_user='jiacx@lamda.nju.edu.cn'      # 收件人邮箱账号，我这边发送给自己
 
-def setup(resume: Union[bool, Path] = False):
+    ret=True
+    try:
+        # msg=MIMEText('填写邮件内容','plain','utf-8')      #此处为仅填写文本数据
+        msg=MIMEText(msg,'html','utf-8')      #需要发送html数据的时候用这种形式
+        msg['From']=formataddr(["FromRunoob",my_sender])  # 括号里的对应发件人邮箱昵称、发件人邮箱账号
+        msg['To']=formataddr(["FK",my_user])              # 括号里的对应收件人邮箱昵称、收件人邮箱账号
+        msg['Subject']=name                # 邮件的主题，也可以说是标题
+ 
+        server=smtplib.SMTP_SSL("smtp.163.com", 465)  # 发件人邮箱中的SMTP服务器
+        server.login(my_sender, my_pass)  # 括号中对应的是发件人邮箱账号、邮箱密码
+        server.sendmail(my_sender,[my_user,],msg.as_string())  # 括号中对应的是发件人邮箱账号、收件人邮箱账号、发送邮件
+        server.quit()  # 关闭连接
+    except Exception:  # 如果 try 中的语句没有执行，则会执行下面的 ret=False
+        ret=False
+    return ret
+
+
+def setup(resume: Union[bool, Path] = True):
     logger = choose_logger(logger_name, name=name, resume=resume)
 
-    strategy = FSDPStrategy(auto_wrap_policy={Block}, cpu_offload=False, limit_all_gathers=True, activation_checkpointing_policy=None, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+    strategy = FSDPStrategy(auto_wrap_policy={Block}, cpu_offload=False, limit_all_gathers=True, activation_checkpointing_policy={Block}, state_dict_type="full", sharding_strategy="FULL_SHARD")
     fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-mixed", loggers=[logger])
     fabric.launch()
 
@@ -106,6 +130,8 @@ def main(fabric, resume):
         out_dir.mkdir(parents=True, exist_ok=True)
 
     config = Config.from_name(model_name)
+    if test:
+        config.n_layer = 2
 
     train_dataloader, val_dataloader = create_dataloaders(batch_size=micro_batch_size, block_size=config.block_size)
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
@@ -117,7 +143,8 @@ def main(fabric, resume):
     with fabric.init_module(empty_init=False):
         model = IntentionGPT(config, hidden_dim=hidden_dim)
         model.apply(partial(init_weights, n_layer=config.n_layer, n_embd=config.n_embd))
-
+        
+    mark_only_policy_as_trainable(model)
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
 
@@ -138,10 +165,13 @@ def main(fabric, resume):
     }
 
     if resume is True:
-        resume = max(out_dir.glob("*.pth"), key=(lambda p: int(p.name.split("-")[1])))
+        resume = max(out_dir.glob("*-vae.pth"), key=(lambda p: int(p.name.split("-")[1])))
     if resume:
         fabric.print(f"Resuming training from {resume}")
         fabric.load(resume, state)
+    state['train_dataloader'] = train_dataloader
+    state['iter_num'] = 0
+    state['step_count'] = 0
 
     train_time = time.perf_counter()
     train(fabric, state, train_dataloader, val_dataloader, resume)
@@ -182,9 +212,19 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     if test:
         checkpoint_path = out_dir / f"step-{0:08d}.pth"
         fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
-        fabric.save(checkpoint_path, state)
+        save_info = {
+                "model": model,
+                "optimizer": optimizer,
+                # "train_dataloader": train_dataloader,
+                "hparams": hparams,
+                "iter_num": 0,
+                "step_count": 0,
+            }
+        fabric.save(checkpoint_path, save_info)
     
     best_loss = 100000.
+    grad_before = None
+    grad_after = None
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
             break
@@ -204,25 +244,14 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             problem = 0
             is_accumulating = state["iter_num"] % gradient_accumulation_iters != 0
             with fabric.no_backward_sync(model, enabled=is_accumulating):
-                logits, info = model(input_ids, train_mode=True)
-                enc_loss = chunked_kld(info['mean'], info['logvar'])
+                logits, info = model(input_ids, train_mode=True, action_copy=True)
                 dec_loss = chunked_cross_entropy(logits, targets)
-                # bc_loss = chunked_bc(info['mean'], info['logvar'], info['mean_bc'], info['logvar_bc'])
-                loss = beta * enc_loss + dec_loss #+ bc_loss
+                loss = dec_loss #+ bc_loss
                 fabric.backward(loss / gradient_accumulation_iters)
                 entropy = compute_entropy(logits.detach())
-                
-                problem = 1
-                
-                # bc_logits, bc_info = model(input_ids.detach(), train_mode=True, action_copy=True)
-                # bc_enc_loss = chunked_kld(bc_info['mean'], bc_info['logvar'])
-                # bc_dec_loss = chunked_cross_entropy(bc_logits, targets.detach())
-                # # bc_loss = chunked_bc(info['mean'], info['logvar'], info['mean_bc'], info['logvar_bc'])
-                # bc_loss = beta * bc_enc_loss + bc_dec_loss #+ bc_loss
-                # fabric.backward(bc_loss / gradient_accumulation_iters)
-                # bc_entropy = compute_entropy(bc_logits.detach())
         except:
             print(input_ids.shape, problem, file=open("test.txt", "w"))
+            mail(name=name, msg="experiments killed at {}".format(str(state["iter_num"])))
             assert 0
 
         running_loss.update(loss.detach())
@@ -231,7 +260,20 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
         # running_loss_bc.update(bc_loss.detach())
 
         if not is_accumulating:
+            grad_before = 0.
+            for params in model.parameters():
+                grad = params.grad
+                if grad is not None:
+                    grad_before += (grad ** 2).mean().item()
+            
             fabric.clip_gradients(model, optimizer, max_norm=grad_clip)
+            
+            grad_after = 0.
+            for params in model.parameters():
+                grad = params.grad
+                if grad is not None:
+                    grad_after += (grad ** 2).mean().item()
+            
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
@@ -268,6 +310,9 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
                 "value/std_std": info['std_std'].item(),
                 "value/std_max": info['std_max'].item(),
                 "value/std_min": info['std_min'].item(),
+                
+                "grad/grad_before": grad_before if grad_before is not None else 0.,
+                "grad/grad_after": grad_after if grad_after is not None else 0.,
                 
                 # "bc_value/output_entropy": bc_entropy.item(),
                 # "bc_value/ent_mean": bc_info['entropy_mean'].item(),
@@ -318,12 +363,16 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
             fabric.log_dict(metrics, step=state["iter_num"])
             fabric.barrier()
-
-        if not is_accumulating and state["step_count"] % save_step_interval == 0:
-            checkpoint_path = out_dir / f"step-{state['step_count']:08d}.pth"
-            fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
-            fabric.save(checkpoint_path, state)
-
+            
+        try:
+            if not is_accumulating and state["step_count"] % save_step_interval == 0:
+                checkpoint_path = out_dir / f"step-{state['step_count']:08d}-bc.pth"
+                fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
+                mail(name=name, msg="new model saved at {}, val loss {}, step {}, best loss {}".format(state["iter_num"], val_loss, state["step_count"], best_loss))
+                fabric.save(checkpoint_path, state)
+        except:
+            mail(name=name, msg="new model saving failed at {}, val loss {}, step {}, best loss {}".format(state["iter_num"], val_loss, state["step_count"], best_loss))
+            assert 0
 
 @torch.no_grad()
 def validate(fabric: L.Fabric, model: nn.Module, val_dataloader: DataLoader, max_iters: int) -> torch.Tensor:
@@ -351,38 +400,38 @@ def create_dataloaders(batch_size: int, block_size: int, num_workers: int = 8) -
     # Increase by one because we need the next word as well
     effective_block_size = block_size + 1
 
-    # train_datasets = [
-    #     StreamingDataset(
-    #         input_dir="data/slimpajama/train",
-    #         item_loader=TokensLoader(block_size=effective_block_size),
-    #         shuffle=True,
-    #         drop_last=True,
-    #     ),
-    #     StreamingDataset(
-    #         input_dir="data/starcoder",
-    #         item_loader=TokensLoader(block_size=effective_block_size),
-    #         shuffle=True,
-    #         drop_last=True,
-    #     ),
-    # ]
-    train_datasets = StreamingDataset(
-        # input_dir="/data/wangpy/Research/data/starcoder",
-        input_dir="/data/scz3286/lit-gpt/data/starcoder",
-        item_loader=TokensLoader(block_size=effective_block_size),
-        shuffle=True,
-        drop_last=True,
-    )
+    train_datasets = [
+        StreamingDataset(
+            input_dir="/data/scz3286/lit-gpt/data/slimpajama/train",
+            item_loader=TokensLoader(block_size=effective_block_size),
+            shuffle=True,
+            drop_last=True,
+        ),
+        StreamingDataset(
+            input_dir="/data/scz3286/lit-gpt/data/starcoder",
+            item_loader=TokensLoader(block_size=effective_block_size),
+            shuffle=True,
+            drop_last=True,
+        ),
+    ]
+    # train_datasets = StreamingDataset(
+    #     # input_dir="/data/wangpy/Research/data/starcoder",
+    #     input_dir="/data/scz3286/lit-gpt/data/starcoder",
+    #     item_loader=TokensLoader(block_size=effective_block_size),
+    #     shuffle=True,
+    #     drop_last=True,
+    # )
 
     # Mix SlimPajama data and Starcoder data with these proportions:
-    # weights = (0.693584, 0.306416)
-    # combined_dataset = CombinedStreamingDataset(datasets=train_datasets, seed=42, weights=weights)
+    weights = (0.693584, 0.306416)
+    combined_dataset = CombinedStreamingDataset(datasets=train_datasets, seed=42, weights=weights)
     train_dataloader = StreamingDataLoader(
-        train_datasets, batch_size=batch_size, pin_memory=True, num_workers=num_workers, drop_last=True
+        combined_dataset, batch_size=batch_size, pin_memory=True, num_workers=num_workers, drop_last=True
     )
 
     val_dataset = StreamingDataset(
         # input_dir="/data/wangpy/Research/data/starcoder_eval",
-        input_dir="/data/scz3286/lit-gpt/data/starcoder_eval",
+        input_dir="/data/scz3286/lit-gpt/data/slimpajama/validation",
         item_loader=TokensLoader(block_size=effective_block_size),
         shuffle=True,
         # Consider setting to False, but we would lose some samples due to truncation when world size > 1

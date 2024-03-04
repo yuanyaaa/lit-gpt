@@ -30,7 +30,7 @@ sys.path.append(str(wd))
 from lit_gpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
 from lit_gpt.utils import CycleIterator, chunked_cross_entropy, compute_entropy, num_parameters
 
-num_layer = 44
+num_layer = 22
 # System settings
 model_name = "tiny-llama-1.1b"
 name = "tiny-llama-1.1b" if num_layer == 22 else "tiny-llama-1.1b-layer={}".format(num_layer)
@@ -42,7 +42,7 @@ devices = torch.cuda.device_count() or 1
 global_batch_size = 512
 learning_rate = 4e-4 if num_layer == 22 else 1.6e-4
 micro_batch_size = 4
-max_tokens = int(3e9)  # 3 trillion   # 20 billion
+max_tokens = int(30e9)  # 3 trillion   # 20 billion
 warmup_steps = 2000
 log_step_interval = 1
 eval_iters = 100

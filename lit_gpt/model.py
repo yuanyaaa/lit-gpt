@@ -20,6 +20,66 @@ from copy import deepcopy
 def copy_param(model1, model2):
     for param1, param2 in zip(model1.parameters(), model2.parameters()):
         param1.data.copy_(param2.data)
+
+def mark_no_policy_as_trainable(model: nn.Module, bias: str = "none") -> None:
+    """Freeze all modules except LoRA's and depending on 'bias' value unfreezes bias weights.
+
+    Args:
+        model: model with LoRA layers
+        bias:
+            ``"none"``: all bias weights will be frozen,
+            ``"lora_only"``: only bias weight for LoRA layers will be unfrozen,
+            ``"all"``: all bias weights will be unfrozen.
+
+    Raises:
+        NotImplementedError: if `bias` not in ["none", "lora_only", "all"]
+    """
+    # freeze all layers except LoRA's
+    for n, p in model.named_parameters():
+        if "transformer_bc" in n:
+            p.requires_grad = False
+            print("labelled")
+
+    # depending on the `bias` value unfreeze bias weights
+    if bias == "none":
+        return
+    if bias == "all":
+        for n, p in model.named_parameters():
+            if "bias" in n:
+                p.requires_grad = True
+    else:
+        raise NotImplementedError
+    
+
+def mark_no_emb_as_trainable(model: nn.Module, bias: str = "none") -> None:
+    """Freeze all modules except LoRA's and depending on 'bias' value unfreezes bias weights.
+
+    Args:
+        model: model with LoRA layers
+        bias:
+            ``"none"``: all bias weights will be frozen,
+            ``"lora_only"``: only bias weight for LoRA layers will be unfrozen,
+            ``"all"``: all bias weights will be unfrozen.
+
+    Raises:
+        NotImplementedError: if `bias` not in ["none", "lora_only", "all"]
+    """
+    # freeze all layers except LoRA's
+    for n, p in model.named_parameters():
+        if "wte" in n:
+            p.requires_grad = False
+            print("labelled")
+
+    # depending on the `bias` value unfreeze bias weights
+    if bias == "none":
+        return
+    if bias == "all":
+        for n, p in model.named_parameters():
+            if "bias" in n:
+                p.requires_grad = True
+    else:
+        raise NotImplementedError
+
         
 def mark_only_policy_as_trainable(model: nn.Module, bias: str = "none") -> None:
     """Freeze all modules except LoRA's and depending on 'bias' value unfreezes bias weights.
@@ -49,6 +109,256 @@ def mark_only_policy_as_trainable(model: nn.Module, bias: str = "none") -> None:
                 p.requires_grad = True
     else:
         raise NotImplementedError
+    
+    
+class IntentionGPT_v0(nn.Module):
+    def __init__(self, config: Config, hidden_dim: int = 64, policy_training=False) -> None:
+        super().__init__()
+        assert config.padded_vocab_size is not None
+        self.config = config
+
+        self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
+        
+        self.enc_layer_num = config.n_layer // 2
+        self.dec_layer_num = config.n_layer - self.enc_layer_num
+        self.hidden_num = hidden_dim
+        
+        # self.dec_layer_num = 1
+        self.transformer_state_enc = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
+                h=nn.ModuleList(Block(config) for _ in range(self.enc_layer_num)),
+            )
+        )
+        self.transformer_action_enc = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
+                h=nn.ModuleList(Block(config) for _ in range(self.enc_layer_num)),
+            )
+        )
+        self.transformer_bc = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
+                h=nn.ModuleList(Block(config) for _ in range(self.enc_layer_num)),
+            )
+        )
+        self.mean_layer = nn.Linear(config.n_embd, self.hidden_num, bias=config.lm_head_bias)
+        self.logvar_layer = nn.Linear(config.n_embd, self.hidden_num, bias=config.lm_head_bias)
+        self.trans_layer = nn.Linear(self.hidden_num, config.n_embd, bias=config.lm_head_bias)
+        self.trans_norm = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.dynamics_layer = nn.Linear(config.n_embd * 2, config.n_embd, bias=config.lm_head_bias)
+        
+        self.transformer_dec = nn.ModuleDict(
+            dict(
+                h=nn.ModuleList(Block(config) for _ in range(self.dec_layer_num)),
+                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+            )
+        )
+        
+        self.max_seq_length = self.config.block_size
+        self.mask_cache: Optional[torch.Tensor] = None
+        
+        self.action_range = [-10., 10.]
+        self.action_bound = None
+        
+    @property
+    def max_seq_length(self) -> int:
+        return self._max_seq_length
+
+    @max_seq_length.setter
+    def max_seq_length(self, value: int) -> None:
+        """
+        When doing inference, the sequences used might be shorter than the model's context length.
+        This allows setting a smaller number to avoid allocating unused memory
+        """
+        if value > self.config.block_size:
+            raise ValueError(f"Cannot attend to {value}, block size is only {self.config.block_size}")
+        self._max_seq_length = value
+        if not hasattr(self, "cos"):
+            # first call
+            cos, sin = self.rope_cache()
+            self.register_buffer("cos", cos, persistent=False)
+            self.register_buffer("sin", sin, persistent=False)
+        # override
+        elif value != self.cos.size(0):
+            self.cos, self.sin = self.rope_cache(device=self.cos.device)
+        # the mask and kv cache size will get updated on `set_kv_cache`. we cannot update it here because we don't know
+        # if the kv cache is expected
+
+    def reset_parameters(self) -> None:
+        # Trigger resetting the rope-cache
+        self.cos, self.sin = self.rope_cache()
+
+    def _init_weights(self, module: nn.Module) -> None:
+        """Meant to be used with `gpt.apply(gpt._init_weights)`."""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def reparameterization(self, mean, logvar):
+        std = torch.exp(0.5 * logvar)
+        epsilon = torch.randn_like(std)
+        z = mean + std*epsilon
+        z = z.clamp(self.action_range[0], self.action_range[1])
+        return z
+    
+    def forward(self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, train_mode=False, action_copy=False, action_only=False, action_bias=None, action_mask_ratio=None) -> torch.Tensor:
+        T = idx.size(1)
+        if self.max_seq_length < T:
+            raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
+
+        if input_pos is not None:  # use the kv cache
+            cos = self.cos.index_select(0, input_pos)
+            sin = self.sin.index_select(0, input_pos)
+            if self.mask_cache is None:
+                raise TypeError("You need to call `gpt.set_kv_cache()`")
+            mask = self.mask_cache.index_select(2, input_pos)
+        else:
+            cos = self.cos[:T]
+            sin = self.sin[:T]
+            mask = None
+            
+        if action_bias is not None:
+            x_s = self.transformer_state_enc.wte(idx) 
+            for block_s in self.transformer_state_enc.h:
+                x_s = block_s(x_s, cos, sin, mask, input_pos)
+            
+            x_a = self.transformer_action_enc.wte(idx) 
+            for block_a in self.transformer_action_enc.h:
+                x_a = block_a(x_a, cos, sin, mask, input_pos)    
+            x_a[:, :-1] = x_a[:, 1:].clone()
+            mean, logvar = self.mean_layer(x_a), self.logvar_layer(x_a)
+            action = self.reparameterization(mean, logvar)
+            if action_only:
+                return action
+            if action_only:
+                return action
+            if type(action_bias) != float:
+                action = action_bias
+            elif type(action_bias) == bool:
+                return action
+            else:
+                action += action_bias
+            
+            x_a = self.trans_norm(self.trans_layer(action))
+            x = torch.cat([x_s, x_a], dim=-1)
+            x = self.dynamics_layer(x) + x_s
+            for block in self.transformer_dec.h:
+                x = block(x, cos, sin, mask, input_pos)
+            x = self.transformer_dec.ln_f(x)
+            x = self.lm_head(x)
+            
+        elif not action_copy:
+            x_s = self.transformer_state_enc.wte(idx) 
+            for block_s in self.transformer_state_enc.h:
+                x_s = block_s(x_s, cos, sin, mask, input_pos)
+            
+            x_a = self.transformer_action_enc.wte(idx) 
+            for block_a in self.transformer_action_enc.h:
+                x_a = block_a(x_a, cos, sin, mask, input_pos)    
+            x_a[:, :-1] = x_a[:, 1:]
+            mean, logvar = self.mean_layer(x_a), self.logvar_layer(x_a)
+            action = self.reparameterization(mean, logvar)
+            if action_only:
+                return action
+            
+            if action_mask_ratio is not None:
+                random_hidden_mask = torch.rand(action.shape[0], action.shape[1])
+                action[random_hidden_mask < action_mask_ratio] = 0.
+            
+            x_a = self.trans_norm(self.trans_layer(action))
+            x = torch.cat([x_s, x_a], dim=-1)
+            x = self.dynamics_layer(x) + x_s
+            for block in self.transformer_dec.h:
+                x = block(x, cos, sin, mask, input_pos)
+            x = self.transformer_dec.ln_f(x)
+            x = self.lm_head(x)
+        else:
+            x_s = self.transformer_state_enc.wte(idx) 
+            for block_s in self.transformer_state_enc.h:
+                x_s = block_s(x_s, cos, sin, mask, input_pos)
+            
+            x_a = self.transformer_bc.wte(idx) 
+            for block_a in self.transformer_bc.h:
+                x_a = block_a(x_a, cos, sin, mask, input_pos)
+            mean, logvar = self.mean_layer(x_a), self.logvar_layer(x_a)
+            action = self.reparameterization(mean, logvar)
+            if action_only:
+                return action
+            
+            x_a = self.trans_norm(self.trans_layer(action))
+            x = torch.cat([x_s, x_a], dim=-1)
+            x = self.dynamics_layer(x) + x_s
+            for block in self.transformer_dec.h:
+                x = block(x, cos, sin, mask, input_pos)
+            x = self.transformer_dec.ln_f(x)
+            x = self.lm_head(x)
+            
+        if not train_mode:
+            return x
+        
+        ent = 0.5 * torch.log(2 * torch.pi * torch.e * torch.exp(logvar))
+        return x, {"mean": mean, 
+                                 "logvar": logvar, 
+                                 "z": action, 
+                                 "entropy_mean": ent.mean(), 
+                                 "entropy_std": ent.std(), 
+                                 "entropy_max": ent.max(dim=-1)[0].mean(), 
+                                 "entropy_min": ent.min(dim=-1)[0].mean(),
+                                 "mean_mean": mean.mean(), 
+                                 "mean_std": mean.std(), 
+                                 "mean_max": mean.max(dim=-1)[0].mean(), 
+                                 "mean_min": mean.min(dim=-1)[0].mean(),
+                                 "std_mean": torch.exp(0.5 * logvar).mean(), 
+                                 "std_std": torch.exp(0.5 * logvar).std(), 
+                                 "std_max": torch.exp(0.5 * logvar).max(dim=-1)[0].mean(), 
+                                 "std_min": torch.exp(0.5 * logvar).min(dim=-1)[0].mean(),}  # (b, t, vocab_size)
+
+    @classmethod
+    def from_name(cls, name: str, **kwargs: Any) -> Self:
+        return cls(Config.from_name(name, **kwargs))
+
+    def rope_cache(self, device: Optional[torch.device] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        return build_rope_cache(
+            seq_len=self.max_seq_length,
+            n_elem=self.config.rope_n_elem,
+            device=device,
+            condense_ratio=self.config.rope_condense_ratio,
+            base=self.config.rope_base,
+        )
+
+    def set_kv_cache(
+        self,
+        batch_size: int,
+        rope_cache_length: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        if rope_cache_length is None:
+            rope_cache_length = self.cos.size(-1)
+        max_seq_length = self.max_seq_length
+
+        # initialize the kv cache for all blocks
+        for block_e, block_d in zip(self.transformer_enc.h, self.transformer_dec.h):
+            block_e.attn.kv_cache = block_e.attn.build_kv_cache(
+                batch_size, max_seq_length, rope_cache_length, device, dtype
+            )
+            block_d.attn.kv_cache = block_d.attn.build_kv_cache(
+                batch_size, max_seq_length, rope_cache_length, device, dtype
+            )
+
+        if self.mask_cache is None or self.mask_cache.size(3) != max_seq_length:
+            # passing `attn_mask` to SDPA disables the flash implementation. since we only need the mask
+            # for the kv-cache support (only during inference), we only create it in that situation
+            self.mask_cache = build_mask_cache(max_seq_length, device)
+
+    def clear_kv_cache(self) -> None:
+        self.mask_cache = None
+        for block in self.transformer.h:
+            block.attn.kv_cache = None
 
 # class IntentionGPT(nn.Module):
 #     def __init__(self, config: Config) -> None:
@@ -503,8 +813,6 @@ class IntentionGPT(nn.Module):
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
-        
-        self.mask_ratio = 0.2
 
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
         
@@ -539,32 +847,34 @@ class IntentionGPT(nn.Module):
         self.max_seq_length = self.config.block_size
         self.mask_cache: Optional[torch.Tensor] = None
         
-        self.action_bound = {
-            'max': torch.tensor([6.113875 , 6.5777893, 6.8294477, 8.54345  , 6.811831 , 6.6963367,
-                                    6.1646347, 6.4111104, 5.652593 , 5.4508934, 5.9877996, 6.0075774,
-                                    6.1689105, 6.3455086, 6.683893 , 6.283728 , 6.261898 , 6.244897 ,
-                                    8.469758 , 6.9886794, 6.358738 , 6.795033 , 6.3013043, 8.905097 ,
-                                    6.1904364, 6.2284484, 7.7058287, 7.2331553, 7.0590057, 6.829509 ,
-                                    6.4691133, 6.189951 , 6.0612907, 7.748613 , 7.0805154, 6.1162047,
-                                    6.0997725, 5.7236795, 6.464234 , 6.296142 , 6.321131 , 6.609757 ,
-                                    7.497074 , 6.031272 , 6.569852 , 6.3502264, 6.383522 , 6.389213 ,
-                                    7.2838693, 6.065119 , 6.7606845, 5.7870913, 6.8777084, 6.166441 ,
-                                    6.3458953, 6.213383 , 6.3802066, 7.687577 , 7.850521 , 5.946508 ,
-                                    5.991638 , 7.244454 , 6.3052583, 5.8255367]), 
-            'min': torch.tensor([-4.2133846, -4.3756566, -5.3546257, -4.206166 , -4.4228315,
-                                    -4.006246 , -5.704546 , -3.8283055, -8.385877 , -3.982117 ,
-                                    -6.324323 , -4.037976 , -4.199621 , -4.3786163, -4.4538393,
-                                    -3.7050607, -5.894009 , -3.9783843, -4.133172 , -4.040438 ,
-                                    -5.581654 , -4.2924147, -4.1396008, -4.070223 , -4.1095805,
-                                    -5.499817 , -4.312846 , -4.2006197, -4.437646 , -4.180575 ,
-                                    -4.321483 , -4.5911922, -3.9698455, -4.1967373, -4.041464 ,
-                                    -4.7122226, -4.8765006, -4.271067 , -4.0399466, -4.330779 ,
-                                    -4.8613696, -4.086382 , -4.0592246, -4.3827515, -4.4790936,
-                                    -4.5089827, -3.8484697, -4.4502745, -4.163373 , -4.150048 ,
-                                    -4.155003 , -3.8105237, -3.6924934, -4.1560483, -4.419029 ,
-                                    -3.8950453, -4.3900237, -5.261915 , -4.9954543, -3.747426 ,
-                                    -5.93973  , -4.495136 , -4.2210994, -4.7534165])
-        }
+        self.action_range = [-10., 10.]
+        self.action_bound = None
+        # self.action_bound = {
+        #     'max': torch.tensor([6.113875 , 6.5777893, 6.8294477, 8.54345  , 6.811831 , 6.6963367,
+        #                             6.1646347, 6.4111104, 5.652593 , 5.4508934, 5.9877996, 6.0075774,
+        #                             6.1689105, 6.3455086, 6.683893 , 6.283728 , 6.261898 , 6.244897 ,
+        #                             8.469758 , 6.9886794, 6.358738 , 6.795033 , 6.3013043, 8.905097 ,
+        #                             6.1904364, 6.2284484, 7.7058287, 7.2331553, 7.0590057, 6.829509 ,
+        #                             6.4691133, 6.189951 , 6.0612907, 7.748613 , 7.0805154, 6.1162047,
+        #                             6.0997725, 5.7236795, 6.464234 , 6.296142 , 6.321131 , 6.609757 ,
+        #                             7.497074 , 6.031272 , 6.569852 , 6.3502264, 6.383522 , 6.389213 ,
+        #                             7.2838693, 6.065119 , 6.7606845, 5.7870913, 6.8777084, 6.166441 ,
+        #                             6.3458953, 6.213383 , 6.3802066, 7.687577 , 7.850521 , 5.946508 ,
+        #                             5.991638 , 7.244454 , 6.3052583, 5.8255367]), 
+        #     'min': torch.tensor([-4.2133846, -4.3756566, -5.3546257, -4.206166 , -4.4228315,
+        #                             -4.006246 , -5.704546 , -3.8283055, -8.385877 , -3.982117 ,
+        #                             -6.324323 , -4.037976 , -4.199621 , -4.3786163, -4.4538393,
+        #                             -3.7050607, -5.894009 , -3.9783843, -4.133172 , -4.040438 ,
+        #                             -5.581654 , -4.2924147, -4.1396008, -4.070223 , -4.1095805,
+        #                             -5.499817 , -4.312846 , -4.2006197, -4.437646 , -4.180575 ,
+        #                             -4.321483 , -4.5911922, -3.9698455, -4.1967373, -4.041464 ,
+        #                             -4.7122226, -4.8765006, -4.271067 , -4.0399466, -4.330779 ,
+        #                             -4.8613696, -4.086382 , -4.0592246, -4.3827515, -4.4790936,
+        #                             -4.5089827, -3.8484697, -4.4502745, -4.163373 , -4.150048 ,
+        #                             -4.155003 , -3.8105237, -3.6924934, -4.1560483, -4.419029 ,
+        #                             -3.8950453, -4.3900237, -5.261915 , -4.9954543, -3.747426 ,
+        #                             -5.93973  , -4.495136 , -4.2210994, -4.7534165])
+        # }
         
     @property
     def max_seq_length(self) -> int:
@@ -605,11 +915,12 @@ class IntentionGPT(nn.Module):
     
     def reparameterization(self, mean, logvar):
         std = torch.exp(0.5 * logvar)
-        epsilon = torch.randn_like(std)
+        epsilon = torch.randn_like(std).clip(-3., 3.)
         z = mean + std*epsilon
+        # z = z.clamp(self.action_range[0], self.action_range[1])
         return z
     
-    def forward(self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, train_mode=False, action_copy=False, action_only=False, action_bias=None) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, train_mode=False, action_copy=False, action_only=False, action_bias=None, action_mask_ratio=0.0) -> torch.Tensor:
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -632,7 +943,12 @@ class IntentionGPT(nn.Module):
                 
             x_a[:, :-1] = x_a[:, 1:].clone()
             mean, logvar = self.mean_layer(x_a), self.logvar_layer(x_a)
-            action = self.reparameterization(mean, logvar)
+            if not train_mode:
+                action = mean
+            else:
+                action = self.reparameterization(mean, logvar)
+            if action_only:
+                return action
             if type(action_bias) != float:
                 action = action_bias
             elif type(action_bias) == bool:
@@ -643,7 +959,7 @@ class IntentionGPT(nn.Module):
             x_a = self.trans_layer(action)
             x_s = self.transformer_dec.wte(idx)
             bs, lens, dims = x_a.size()
-            x = torch.stack([x_s, x_a], dim=1).permute(0, 2, 1, 3).reshape(bs, 2*lens, -1)
+            x = torch.stack([x_a, x_s], dim=1).permute(0, 2, 1, 3).reshape(bs, 2*lens, -1)
             cos = torch.stack([cos, cos], dim=0).permute(1, 0, 2).reshape(2*lens, -1)
             sin = torch.stack([sin, sin], dim=0).permute(1, 0, 2).reshape(2*lens, -1)
             if input_pos is not None:
@@ -664,16 +980,23 @@ class IntentionGPT(nn.Module):
             x_a[:, :-1] = x_a[:, 1:]
             
             mean, logvar = self.mean_layer(x_a), self.logvar_layer(x_a)
-            action = self.reparameterization(mean, logvar)
+            if not train_mode:
+                action = mean
+            else:
+                action = self.reparameterization(mean, logvar)
             if action_only:
                 return action
             if action_bias is not None and type(action_bias) != float:
                 action = action_bias
             
+            if action_mask_ratio is not None:
+                random_hidden_mask = torch.rand(action.shape[0], action.shape[1])
+                action[random_hidden_mask < action_mask_ratio] = 0.
+            
             x_a = self.trans_layer(action)
             x_s = self.transformer_dec.wte(idx)
             bs, lens, dims = x_a.size()
-            x = torch.stack([x_s, x_a], dim=1).permute(0, 2, 1, 3).reshape(bs, 2*lens, -1)
+            x = torch.stack([x_a, x_s], dim=1).permute(0, 2, 1, 3).reshape(bs, 2*lens, -1)
             cos = torch.stack([cos, cos], dim=0).permute(1, 0, 2).reshape(2*lens, -1)
             sin = torch.stack([sin, sin], dim=0).permute(1, 0, 2).reshape(2*lens, -1)
             if input_pos is not None:
@@ -692,7 +1015,10 @@ class IntentionGPT(nn.Module):
                 x_a = block_a(x_a, cos, sin, mask, input_pos)
             
             mean, logvar = self.mean_layer(x_a), self.logvar_layer(x_a)
-            action = self.reparameterization(mean, logvar)
+            if not train_mode:
+                action = mean
+            else:
+                action = self.reparameterization(mean, logvar)
             if action_only:
                 return action
             lb = self.action_bound['min'].to(action.device)
@@ -702,7 +1028,7 @@ class IntentionGPT(nn.Module):
             x_a = self.trans_layer(action)
             x_s = self.transformer_dec.wte(idx.detach())
             bs, lens, dims = x_a.size()
-            x = torch.stack([x_s, x_a], dim=1).permute(0, 2, 1, 3).reshape(bs, 2*lens, -1)
+            x = torch.stack([x_a, x_s], dim=1).permute(0, 2, 1, 3).reshape(bs, 2*lens, -1)
             cos = torch.stack([cos, cos], dim=0).permute(1, 0, 2).reshape(2*lens, -1)
             sin = torch.stack([sin, sin], dim=0).permute(1, 0, 2).reshape(2*lens, -1)
             if input_pos is not None:

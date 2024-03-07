@@ -16,7 +16,7 @@ from typing import Tuple, Union
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from generate.base import generate, generate_with_actions
+from generate.base import generate, generate_with_actions, generate_with_actions_and_teachers
 import lightning as L
 import torch
 import torch.nn as nn
@@ -32,18 +32,18 @@ from torchmetrics.aggregation import RunningMean
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_gpt.model import IntentionGPT, GPT, Block, CausalSelfAttention, Config, LLaMAMLP
+from lit_gpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
 from lit_gpt.utils import CycleIterator, chunked_cross_entropy, chunked_kld, chunked_bc, compute_entropy, num_parameters
-
+from lit_gpt.model import IntentionGPT_v1 as IntentionGPT
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
 beta = 1.5
-hidden_dim = 64
+hidden_dim = 4
 # System settings
 model_name = "tiny-llama-1.1b"
 name = "lit-tiny-llama-1.1b-beta={}-hidden-dim={}".format(beta, hidden_dim)
-name = "tiny-llama-1.1b"
+# name = "tiny-llama-1.1b"
 out_dir = Path(os.getenv("LIGHTNING_ARTIFACTS_DIR", "out")) / name
 logger_name = "tensorboard"
 devices = torch.cuda.device_count() or 1
@@ -90,6 +90,37 @@ def setup(resume: Union[bool, Path] = True):
     main(fabric, resume)
 
 
+def multinomial_num_samples_1(probs: torch.Tensor) -> torch.Tensor:
+    if torch._dynamo.is_compiling():
+        # Faster alternative to `torch.multinomial(probs, num_samples=1)` that is also CUDAGraph friendly
+        distribution = torch.empty_like(probs).exponential_(1)
+        return torch.argmax(probs / distribution, dim=-1, keepdim=True)
+    return torch.multinomial(probs, num_samples=1)
+
+def sample(logits: torch.Tensor, temperature: float = 1.0, top_k = None) -> torch.Tensor:
+    # logits = logits[0, -1]
+    bs, lens = logits.shape[0], logits.shape[1]
+    logits = logits.reshape(bs*lens, -1)
+    # optionally crop the logits to only the top k options
+    if top_k is not None:
+        v, i = torch.topk(logits, min(top_k, logits.size(-1)))
+        # do not use `torch.where` as in nanogpt because it will repeat top-k collisions
+        logits = torch.full_like(logits, float("-inf")).scatter_(-1, i, v)
+    # optionally scale the logits and sample from a probability distribution
+    if temperature > 0.0:
+        probs = torch.nn.functional.softmax(logits / temperature, dim=-1)
+        return multinomial_num_samples_1(probs)
+    return torch.argmax(logits, dim=-1, keepdim=True).reshape(bs*lens)
+
+def next_token(model, input_pos: torch.Tensor, x: torch.Tensor, action_bias: float, **kwargs) -> torch.Tensor:
+    if type(action_bias) == bool and not action_bias:
+        logits = model(x)
+    else:
+        logits = model(x, action_bias=action_bias)
+    next = sample(logits, **kwargs)
+    return next.to(dtype=x.dtype)
+
+
 def main(fabric, resume):
     if fabric.global_rank == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -112,14 +143,14 @@ def main(fabric, resume):
 
     model = torch.compile(model)
     model = fabric.setup(model)
-    # optimizer = torch.optim.AdamW(
-    #     model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), fused=True
-    # )
-    # optimizer = fabric.setup_optimizers(optimizer)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), fused=True
+    )
+    optimizer = fabric.setup_optimizers(optimizer)
 
     state = {
         "model": model,
-        # "optimizer": optimizer,
+        "optimizer": optimizer,
         # "train_dataloader": train_dataloader,
         "hparams": hparams,
         "iter_num": 0,
@@ -128,7 +159,6 @@ def main(fabric, resume):
 
     if resume is True:
         resume = max(out_dir.glob("*.pth"), key=(lambda p: int(p.name.split("-")[1])))
-        print("Test", resume)
     if resume:
         fabric.print(f"Resuming training from {resume}")
         fabric.load(resume, state)
@@ -140,15 +170,10 @@ def main(fabric, resume):
     
     actions = []
     
-    sentence = """const std = @import("std"); const data = @embedFile("data/day0"""
+    sentence = """In"""
     instructions = [
-    """const std = @import("std"); const data = @embedFile("data/day08.png");""", 
-    """const std = @import("std"); const data = @embedFile("data/day04.txt");"""]
+    """In buildings containing flats or in housing developments where there are private areas used in common and not owned by specific properties, the cost of maintaining those areas needs to be recovered. With flats these charges are called 'service charges' and in housing developments they are called 'rent charges'. The maintenance is usually organised by a third party, such as a landlord or a management company. Usually an estimate as to the charge is given at the beginning of a pre-defined year and a payment on account made. At the end of the year, accounts are produced and balancing credits or additional payments made. """]
     
-    # sentence = """const std = @import("std"); const Allocator = std.mem.Allocator; const assert = std.debug.assert; const print = std.debug.print; const data = @embedFile("data/day0"""
-    # instructions = [
-    # """const std = @import("std"); const Allocator = std.mem.Allocator; const assert = std.debug.assert; const print = std.debug.print; const data = @embedFile("data/day08"); const EntriesList = std.ArrayList(Inst);""", 
-    # """const std = @import("std"); const Allocator = std.mem.Allocator; const assert = std.debug.assert; const print = std.debug.print; const data = @embedFile("data/day04.txt"); const Record = struct"""]
     for instruction in instructions:
         encoded = tokenizer.encode(instruction, device=fabric.device).contiguous().long()
         prompt_length = encoded.size(0)
@@ -156,18 +181,41 @@ def main(fabric, resume):
         L.seed_everything(1234)
         t0 = time.perf_counter()
         with torch.no_grad():
-            _, info = model(encoded.view(1, -1), train_mode=True, action_bias=0.0)
-        actions.append(info['mean'])
+            action = model(encoded.view(1, -1), train_mode=True, action_only=True, action_bias=0.0)
+        actions.append(action)
         
     for action in actions:
-        encoded = tokenizer.encode(sentence, device=fabric.device).contiguous().long()
+        # encoded = tokenizer.encode(sentence, device=fabric.device).contiguous().long()
+        encoded = tokenizer.encode(instructions[0], device=fabric.device).contiguous().long()
         prompt_length = encoded.size(0)
         max_returned_tokens = min(prompt_length + max_new_tokens, action.shape[1])
-        y = generate_with_actions(model, encoded, max_returned_tokens, temperature=0.8, top_k=200, eos_id=tokenizer.eos_id, action_bias=action)
+        
+        random_encoded = torch.randint_like(encoded.int(), 32000).long()
+        mask = (torch.rand_like(encoded.float()) > 0.90).long()
+        encoded = (encoded * (1 - mask) + random_encoded * mask).contiguous().long()
+        
+        y = next_token(model, 0, encoded.view(1, -1), action_bias=0.0, temperature=0.8, top_k=200)
+        
         t = time.perf_counter() - t0
-        output = tokenizer.decode(y)
-        # output = output.split("### Response:")[1].strip()
-        fabric.print(output)
+        sentence = tokenizer.decode(y)
+        fabric.print(sentence)
+        # fabric.print(encoded.shape, y.shape)
+        fabric.print((encoded[1:] == y[:-1]).float().mean())
+        
+    # for action in actions:
+    #     # encoded = tokenizer.encode(sentence, device=fabric.device).contiguous().long()
+    #     encoded = tokenizer.encode(instructions[0], device=fabric.device).contiguous().long()
+    #     prompt_length = encoded.size(0)
+    #     max_returned_tokens = min(prompt_length + max_new_tokens, action.shape[1])
+        
+    #     y = generate_with_actions_and_teachers(model, encoded, max_returned_tokens, temperature=0.8, top_k=200, eos_id=tokenizer.eos_id, action_bias=action)
+        
+    #     # y = generate_with_actions(model, encoded, max_returned_tokens, temperature=0.8, top_k=200, eos_id=tokenizer.eos_id, action_bias=action)
+    #     t = time.perf_counter() - t0
+    #     sentence = tokenizer.decode(y)
+    #     # output = output.split("### Response:")[1].strip()
+    #     fabric.print(sentence)
+    #     fabric.print(encoded, y)
 
 def choose_logger(logger_name: str, name: str, resume: Union[bool, Path], *args, **kwargs):
     if logger_name == "csv":

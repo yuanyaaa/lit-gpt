@@ -255,7 +255,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             assert 0
 
         running_loss.update(loss.detach())
-        running_loss_enc.update(enc_loss.detach())
+        running_loss_enc.update(dec_loss.detach())
         running_loss_dec.update(dec_loss.detach())
         # running_loss_bc.update(bc_loss.detach())
 

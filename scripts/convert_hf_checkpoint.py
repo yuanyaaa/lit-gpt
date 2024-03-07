@@ -282,15 +282,16 @@ def load_param(param: Union[torch.Tensor, NotYetLoadedTensor], name: str, dtype:
 @torch.inference_mode()
 def convert_hf_checkpoint(
     *,
-    checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
-    model_name: Optional[str] = None,
+    checkpoint_dir: Path = Path("/data/scz3286/lit-gpt/data/tinyllama-2.5T"),
+    model_name: Optional[str] = "tiny-llama-1.1b",
     dtype: Optional[str] = None,
 ) -> None:
     if model_name is None:
         model_name = checkpoint_dir.name
     if dtype is not None:
         dtype = getattr(torch, dtype)
-
+    
+    print(model_name)
     config = Config.from_name(model_name)
     config_dict = asdict(config)
     print(f"Model config {config_dict}")

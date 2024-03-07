@@ -139,10 +139,9 @@ def main(fabric, resume):
     
     actions = []
     
-    sentence = """const std = @import("std"); const data = @embedFile("data/day0"""
+    sentence = """In buildings containing flats or in housing developments where there are private areas used in common and not owned by specific properties,"""
     instructions = [
-    """const std = @import("std"); const data = @embedFile("data/day08.png"); const Image""", 
-    """const std = @import("std"); const data = @embedFile("data/day04.txt"); const Record"""]
+    """In buildings containing flats or in housing developments where there are private areas used in common and not owned by specific properties, the cost of maintaining those areas needs to be recovered. With flats these charges are called 'service charges' and in housing developments they are called 'rent charges'. The maintenance is usually organised by a third party, such as a landlord or a management company. Usually an estimate as to the charge is given at the beginning of a pre-defined year and a payment on account made. At the end of the year, accounts are produced and balancing credits or additional payments made. The service charge costs can be significant and you need to consider this when purchasing. You need to consider the history of payments and future payments. Buildings with flat roofs or lifts can produce particularly high service charges. You can access any of our property lawyers at any of our offices spread throughout Surrey, Hampshire and Greater London including Kingston upon Thames, Bordon, Cheam, Canary Wharf, Leatherhead, Raynes Park, Surbiton, Tolworth or Walton on Thames."""]
     # sentence = """const std = @import("std"); const Allocator = std.mem.Allocator; const assert = std.debug.assert; const print = std.debug.print; const data = @embedFile("data/day0"""
     # instructions = [
     # """const std = @import("std"); const Allocator = std.mem.Allocator; const assert = std.debug.assert; const print = std.debug.print; const data = @embedFile("data/day08"); const EntriesList = std.ArrayList(Inst);""", 
@@ -156,6 +155,7 @@ def main(fabric, resume):
         output = tokenizer.decode(y)
         # output = output.split("### Response:")[1].strip()
         fabric.print(output)
+        print(output)
 
 def choose_logger(logger_name: str, name: str, resume: Union[bool, Path], *args, **kwargs):
     if logger_name == "csv":

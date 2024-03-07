@@ -36,6 +36,29 @@ def chunked_bc(
 ) -> torch.Tensor:
     
     return F.mse_loss(mean.detach(), mean_bc) + F.mse_loss(logvar.detach(), logvar_bc)
+
+
+def chunked_kl_time(
+    mean: Union[torch.Tensor, List[torch.Tensor]],
+    logvar: Union[torch.Tensor, List[torch.Tensor]],
+    chunk_size: int = 0,
+    ignore_index: int = -1,
+) -> torch.Tensor:
+    mean_ = torch.zeros_like(mean)
+    mean_[:, :-1] = mean[:, 1:]
+    logvar_ = torch.ones_like(logvar)
+    logvar_[:, :-1] = logvar[:, 1:]
+    
+    # no chunking at all
+    mean = mean.reshape(-1, mean.size(-1))
+    logvar = logvar.reshape(-1, logvar.size(-1))
+    
+    mean_ = mean_.reshape(-1, mean_.size(-1))
+    logvar_ = logvar_.reshape(-1, logvar_.size(-1))
+    
+    kld = 0.5 * (logvar_ - logvar + (torch.exp(logvar) + (mean - mean_)**2) / torch.exp(logvar_) - 1)
+    return kld.mean()
+
  
 def chunked_kld(
     mean: Union[torch.Tensor, List[torch.Tensor]],

@@ -27,40 +27,20 @@ from torchmetrics.aggregation import RunningMean
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_gpt.model import IntentionGPT, GPT, Block, CausalSelfAttention, Config, LLaMAMLP, mark_no_policy_as_trainable, mark_no_emb_as_trainable
-from lit_gpt.utils import CycleIterator, chunked_cross_entropy, chunked_kld, chunked_bc, compute_entropy, num_parameters, chunked_kl_time
+from lit_gpt.model import IntentionGPT_v0, GPT, Block, CausalSelfAttention, Config, LLaMAMLP, mark_no_policy_as_trainable, mark_no_emb_as_trainable
+from lit_gpt.utils import CycleIterator, chunked_cross_entropy, chunked_kld, chunked_bc, compute_entropy, num_parameters, chunked_cross_entropy_time
 
 # import torch._dynamo
 # torch._dynamo.config.suppress_errors = True
-
-"""
-(micro=2, global 512, hybrid-shard, activation-chpt=None, ): TFLOPs: 765.85, 47.2 GB, 707.48 ms
-(micro=3, global 768, hybrid-shard, activation-chpt=None, ): TFLOPs: 1148.78, 61.0 GB, 973.72 ms * 2/3
-(micro=4, global 512, hybrid-shard, activation-chpt=None, ): TFLOPs: 1531.71, 75.4 GB, 1238.57 ms * 1/2
-(micro=4, global 512, hybrid-shard, activation-chpt=None, ): TFLOPs: 1531.71, 75.4 GB, 1238.57 ms * 1/2
-(micro=4, global 512, full-shard, activation-chpt=None, cpu-off=True): TFLOPs: 1531.71, 74.4 GB, 1238.50 ms * 1/2
-(micro=4, global 512, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 1531.71, 27.3 GB, 1814.85 ms * 1/2
-(micro=8, global 512, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 3063.41, 39.3 GB, 3663.52 ms * 1/4
-(micro=16, global 512, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 6126.82, 58.3 GB, 6580.31 ms * 1/8
-(micro=24, global 768, fhybrid-shard, activation-chpt={BLOCK}, ): TFLOPs: 9190.23, 68.5 GB, 9724.71 ms * 1/12
-(micro=4, global 512, hybrid-shard, activation-chpt=None, gather-lim=True): TFLOPs: 1531.71, 75.4 GB, 1238.57 ms * 1/2
-(micro=4, global 512, hybrid-shard, activation-chpt=None, gather-lim=False): TFLOPs: 1531.71, 80.1 GB, 1236.20 ms * 1/2
-"""
 
 beta = 1.5
 hidden_dim = 4
 # System settings
 model_name = "tiny-llama-1.1b"
 test = False
-load_premb = True
-without_noise = False
-name = "lit-tiny-llama-1.1b-beta={}-hidden-dim={}".format(beta, hidden_dim)
+name = "intention-tiny-llama-1.1b-beta={}-hidden-dim={}".format(beta, hidden_dim)
 if test:
     name = "lit-tiny-llama-1.1b-beta-test"
-if load_premb:
-    name += "-emb"
-if without_noise:
-    name += "-no_noise"
 out_dir = Path(os.getenv("LIGHTNING_ARTIFACTS_DIR", "out")) / name
 logger_name = "tensorboard"
 devices = torch.cuda.device_count() or 1
@@ -92,61 +72,6 @@ log_iter_interval = log_step_interval * gradient_accumulation_iters
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 
-
-name2idx = {
-    "transformer_enc.h.0.attn.proj.weight": [],
-    "transformer_enc.h.1.attn.proj.weight": [],
-    "transformer_enc.h.10.attn.proj.weight": [],
-    "transformer_enc.h.20.attn.proj.weight": [],
-    
-    "transformer_enc.h.0.attn.attn.weight": [],
-    "transformer_enc.h.1.attn.attn.weight": [],
-    "transformer_enc.h.10.attn.attn.weight": [],
-    "transformer_enc.h.20.attn.attn.weight": [],
-}
-
-def compute_adaptive_lr(optimizer):
-    name2grad = {
-        "transformer_enc.h.0.attn.proj.weight": [0., 0., 0., 0],
-        "transformer_enc.h.1.attn.proj.weight": [0., 0., 0., 0],
-        "transformer_enc.h.10.attn.proj.weight": [0., 0., 0., 0],
-        "transformer_enc.h.20.attn.proj.weight": [0., 0., 0., 0],
-        
-        "transformer_enc.h.0.attn.attn.weight": [0., 0., 0., 0],
-        "transformer_enc.h.1.attn.attn.weight": [0., 0., 0., 0],
-        "transformer_enc.h.10.attn.attn.weight": [0., 0., 0., 0],
-        "transformer_enc.h.20.attn.attn.weight": [0., 0., 0., 0],
-    }
-    for group in optimizer.param_groups:
-        beta1, beta2 = group["betas"]
-        lr = group["lr"]
-        k = 0
-        for p in group["params"]:
-            state = optimizer.state[p]
-            
-            if "step" in state and state["step"] > 0:
-                p_name = getattr(p, "name", None)
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
-                bias_correction1 = 1 - beta1 ** state["step"]
-                bias_correction2 = 1 - beta2 ** state["step"]
-                corrected_exp_avg = exp_avg / bias_correction1
-                corrected_exp_avg_sq = exp_avg_sq / bias_correction2
-                denom = corrected_exp_avg_sq.sqrt().add_(group["eps"])
-                step_size = 1 / denom * lr
-            
-                for name in name2grad.keys():
-                    if k in name2idx[name]:
-                        name2grad[name][0] += torch.min(step_size.abs())
-                        name2grad[name][1] += torch.max(step_size.abs())
-                        name2grad[name][2] += torch.mean(step_size.abs())
-                        name2grad[name][3] += 1
-            
-            k += 1
-    
-    return name2grad
-
-
 def mail(name="", msg=""):
     import smtplib
     from email.mime.text import MIMEText
@@ -175,7 +100,7 @@ def mail(name="", msg=""):
 def setup(resume: Union[bool, Path] = False):
     logger = choose_logger(logger_name, name=name, resume=resume)
 
-    strategy = FSDPStrategy(auto_wrap_policy={Block}, cpu_offload=False, limit_all_gathers=True, activation_checkpointing_policy=None, state_dict_type="full", sharding_strategy="FULL_SHARD")
+    strategy = FSDPStrategy(auto_wrap_policy={Block}, cpu_offload=False, limit_all_gathers=True, activation_checkpointing_policy={Block}, state_dict_type="full", sharding_strategy="FULL_SHARD")
     fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-mixed", loggers=[logger])
     fabric.launch()
 
@@ -202,34 +127,22 @@ def main(fabric, resume):
     fabric.print(f"Loading model with {config.__dict__}")
     t0 = time.perf_counter()
     with fabric.init_module(empty_init=False):
-        model = IntentionGPT(config, hidden_dim=hidden_dim)
+        model = IntentionGPT_v0(config, hidden_dim=hidden_dim)
         model.apply(partial(init_weights, n_layer=config.n_layer, n_embd=config.n_embd))
-    
-    # for idx, (name, _) in enumerate(model.named_parameters()):
-    #     for k in name2idx.keys():
-    #         if name in k:
-    #             if idx not in name2idx[k]:
-    #                 name2idx[k].append(idx)
-    
-    if load_premb:
-        pretrained_model = GPT(config)
-        fabric.load_raw("/data/scz3286/lit-gpt/data/tinyllama-2.5T/lit_model.pth", pretrained_model)
-        model.transformer_dec.wte.load_state_dict(pretrained_model.transformer.wte.state_dict())
-        mark_no_emb_as_trainable(model)
-    mark_no_policy_as_trainable(model)
-    
-    for idx, (name, param) in enumerate(model.named_parameters()):
-        if "wte" in name:
-            if param.requires_grad == True:
-                assert 0
-
+        
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
 
+    # pretrained_model = GPT(config)
+    # fabric.load_raw("/data/wangpy/Research/data/TinyLlama-1.1B-intermediate-step-1195k-token-2.5T/lit_model.pth", pretrained_model)
+    # model.transformer_dec.wte.load_state_dict(pretrained_model.transformer.wte.state_dict())
+    mark_no_policy_as_trainable(model)
+
     model = torch.compile(model)
     model = fabric.setup(model)
+
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), eps=1e-12, fused=True
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), fused=True
     )
     optimizer = fabric.setup_optimizers(optimizer)
 
@@ -255,6 +168,13 @@ def main(fabric, resume):
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
 
+MAX_ITERS = 5000
+INIT_MASK_RATIO = 0.6
+FINAL_MASK_RATIO = 0.1
+def get_mask_ratio(iters):
+    return max(INIT_MASK_RATIO * max(0, (MAX_ITERS - iters)) / MAX_ITERS, FINAL_MASK_RATIO)
+
+
 def train(fabric, state, train_dataloader, val_dataloader, resume):
     model = state["model"]
     optimizer = state["optimizer"]
@@ -263,7 +183,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     throughput = ThroughputMonitor(fabric, window_size=5)
 
     with torch.device("meta"):
-        meta_model = IntentionGPT(model.config, hidden_dim=hidden_dim)
+        meta_model = IntentionGPT_v0(model.config, hidden_dim=hidden_dim)
         x = torch.randint(0, 1, (micro_batch_size, meta_model.config.block_size))
         model_fwd = lambda: meta_model(x)
         model_loss = lambda y: chunked_cross_entropy(y, x, chunk_size=0)
@@ -280,29 +200,27 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
     running_loss = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
     running_loss_enc = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
     running_loss_dec = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
-    # running_loss_cross = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
+    running_loss_cross = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
+    # running_mask_ratio = RunningMean(window=gradient_accumulation_iters, sync_on_compute=False).to(fabric.device)
     fabric.barrier()
     total_t0 = time.perf_counter()
     
-    # if test:
-    checkpoint_path = out_dir / f"step-{0:08d}.pth"
-    fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
-    save_info = {
-            "model": model,
-            "optimizer": optimizer,
-            # "train_dataloader": train_dataloader,
-            "hparams": hparams,
-            "iter_num": 0,
-            "step_count": 0,
-        }
-    fabric.save(checkpoint_path, save_info)
+    if test:
+        checkpoint_path = out_dir / f"step-{0:08d}.pth"
+        fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
+        save_info = {
+                "model": model,
+                "optimizer": optimizer,
+                # "train_dataloader": train_dataloader,
+                "hparams": hparams,
+                "iter_num": 0,
+                "step_count": 0,
+            }
+        fabric.save(checkpoint_path, save_info)
     
     best_loss = 100000.
     grad_before = None
     grad_after = None
-    val_loss = 10000.
-    name2grad = None   
-    save_flag = False 
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
             break
@@ -322,22 +240,23 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             problem = 0
             is_accumulating = state["iter_num"] % gradient_accumulation_iters != 0
             with fabric.no_backward_sync(model, enabled=is_accumulating):
-                logits, info = model(input_ids, train_mode=True)
+                mask_ratio = get_mask_ratio(state["iter_num"])
+                logits, info = model(input_ids, train_mode=True, action_mask_ratio=None)
                 enc_loss = chunked_kld(info['mean'], info['logvar'])
                 dec_loss = chunked_cross_entropy(logits, targets)
-                # cross_loss = chunked_kl_time(info['mean'], info['logvar'])
-                loss = beta * enc_loss + dec_loss #+ cross_loss #+ bc_loss
+                cross_loss = chunked_cross_entropy_time(info['mean'], info['logvar'])
+                loss = beta * enc_loss + dec_loss #+ bc_loss
                 fabric.backward(loss / gradient_accumulation_iters)
                 entropy = compute_entropy(logits.detach())
         except:
             print(input_ids.shape, problem, file=open("test.txt", "w"))
-            mail(name=name, msg="experiments killed at {}".format(str(state["iter_num"])))
+            # mail(name=name, msg="experiments killed at {}".format(str(state["iter_num"])))
             assert 0
 
         running_loss.update(loss.detach())
         running_loss_enc.update(enc_loss.detach())
         running_loss_dec.update(dec_loss.detach())
-        # running_loss_cross.update(cross_loss.detach())
+        running_loss_cross.update(cross_loss.detach())
 
         if not is_accumulating:
             grad_before = 0.
@@ -353,14 +272,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
                 grad = params.grad
                 if grad is not None:
                     grad_after += (grad ** 2).mean().item()
-                    
-            grad_after = 0.
-            for names, params in model.named_parameters():
-                if 'wte' in names:
-                    print(params.grad)
-                    assert params.grad is None
-                    
-            # name2grad = compute_adaptive_lr(optimizer=optimizer)
+            
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
@@ -369,7 +281,7 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             loss = running_loss.compute().item()  # expensive device-to-host synchronization
             enc_loss = running_loss_enc.compute().item()  # expensive device-to-host synchronization
             dec_loss = running_loss_dec.compute().item()  # expensive device-to-host synchronization
-            # cross_loss = running_loss_cross.compute().item()  # expensive device-to-host synchronization
+            cross_loss = running_loss_cross.compute().item()  # expensive device-to-host synchronization
             t1 = time.perf_counter()
             throughput.update(
                 time=(t1 - total_t0),
@@ -382,8 +294,9 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
                 "loss": dec_loss,
                 "loss_enc": enc_loss,
                 "loss_dec": dec_loss,
-                # "loss_time": cross_loss,
+                "loss_time": cross_loss,
                 "loss_total": loss,
+                "value/mask_ratio": mask_ratio,
                 "value/output_entropy": entropy.item(),
                 "value/ent_mean": info['entropy_mean'].item(),
                 "value/ent_std": info['entropy_std'].item(),
@@ -418,15 +331,6 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
                 f" {metrics['iter_time'] * 1000:.2f} ms{' (optimizer.step),' if not is_accumulating else ','}"
                 f" remaining time: {metrics['remaining_time'] / 3600 / 24:.2f} days"
             )
-            
-            adam_param = {}
-            if name2grad is not None:
-                for k in name2grad:
-                    if name2grad[k][3] > 0:
-                        adam_param["adam/{}_min".format(k)] = name2grad[k][0] / name2grad[k][3]
-                        adam_param["adam/{}_max".format(k)] = name2grad[k][1] / name2grad[k][3]
-                        adam_param["adam/{}_mean".format(k)] = name2grad[k][2] / name2grad[k][3]
-            metrics.update(adam_param)
 
             throughput_metrics = throughput.compute()
             metrics.update(throughput_metrics)
@@ -440,7 +344,6 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             
             if val_loss < best_loss:
                 best_loss = val_loss
-                save_flag = True
 
             fabric.print(f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms")
             metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
@@ -448,20 +351,13 @@ def train(fabric, state, train_dataloader, val_dataloader, resume):
             fabric.barrier()
             
         try:
-            if save_flag or (not is_accumulating and state["step_count"] % save_step_interval == 0):
-                if save_flag:
-                    checkpoint_path = out_dir / f"step-best-vae.pth"
-                    fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
-                    mail(name=name, msg="new model saved at {}, val loss {}, step {}, best loss {}".format(state["iter_num"], val_loss, state["step_count"], best_loss))
-                    fabric.save(checkpoint_path, state)
-                else:
-                    checkpoint_path = out_dir / f"step-{state['step_count']:08d}-vae.pth"
-                    fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
-                    mail(name=name, msg="new model saved at {}, val loss {}, step {}, best loss {}".format(state["iter_num"], val_loss, state["step_count"], best_loss))
-                    fabric.save(checkpoint_path, state)
-                save_flag = False
+            if not is_accumulating and state["step_count"] % save_step_interval == 0:
+                checkpoint_path = out_dir / f"step-{state['step_count']:08d}-vae.pth"
+                fabric.print(f"Saving checkpoint to {str(checkpoint_path)!r}")
+                # mail(name=name, msg="new model saved at {}, val loss {}, step {}, best loss {}".format(state["iter_num"], val_loss, state["step_count"], best_loss))
+                fabric.save(checkpoint_path, state)
         except:
-            mail(name=name, msg="new model saving failed at {}, val loss {}, step {}, best loss {}".format(state["iter_num"], val_loss, state["step_count"], best_loss))
+            # mail(name=name, msg="new model saving failed at {}, val loss {}, step {}, best loss {}".format(state["iter_num"], val_loss, state["step_count"], best_loss))
             assert 0
 
 @torch.no_grad()

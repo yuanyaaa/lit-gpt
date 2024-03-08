@@ -161,6 +161,8 @@ class IntentionGPT_v0(nn.Module):
         self.action_range = [-10., 10.]
         self.action_bound = None
         
+        self.policy_training = policy_training
+        
     @property
     def max_seq_length(self) -> int:
         return self._max_seq_length
@@ -205,7 +207,7 @@ class IntentionGPT_v0(nn.Module):
         z = z.clamp(self.action_range[0], self.action_range[1])
         return z
     
-    def forward(self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, train_mode=False, action_copy=False, action_only=False, action_bias=None, action_mask_ratio=None) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, train_mode=False, action_copy=False, action_only=False, action_bias=None, action_zero=False, action_mask_ratio=None) -> torch.Tensor:
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -230,8 +232,12 @@ class IntentionGPT_v0(nn.Module):
             for block_a in self.transformer_action_enc.h:
                 x_a = block_a(x_a, cos, sin, mask, input_pos)    
             x_a[:, :-1] = x_a[:, 1:].clone()
+            mean_t, logvar_t = None, None
             mean, logvar = self.mean_layer(x_a), self.logvar_layer(x_a)
-            action = self.reparameterization(mean, logvar)
+            if not train_mode:
+                action = mean
+            else:
+                action = self.reparameterization(mean, logvar)
             if action_only:
                 return action
             if action_only:
@@ -240,6 +246,8 @@ class IntentionGPT_v0(nn.Module):
                 action = action_bias
             elif type(action_bias) == bool:
                 return action
+            elif action_zero == True:
+                action = action * 0.
             else:
                 action += action_bias
             
@@ -251,7 +259,7 @@ class IntentionGPT_v0(nn.Module):
             x = self.transformer_dec.ln_f(x)
             x = self.lm_head(x)
             
-        elif not action_copy:
+        elif not action_copy and not self.policy_training:
             x_s = self.transformer_state_enc.wte(idx) 
             for block_s in self.transformer_state_enc.h:
                 x_s = block_s(x_s, cos, sin, mask, input_pos)
@@ -260,8 +268,12 @@ class IntentionGPT_v0(nn.Module):
             for block_a in self.transformer_action_enc.h:
                 x_a = block_a(x_a, cos, sin, mask, input_pos)    
             x_a[:, :-1] = x_a[:, 1:]
+            mean_t, logvar_t = None, None
             mean, logvar = self.mean_layer(x_a), self.logvar_layer(x_a)
-            action = self.reparameterization(mean, logvar)
+            if not train_mode:
+                action = mean
+            else:
+                action = self.reparameterization(mean, logvar)
             if action_only:
                 return action
             
@@ -280,12 +292,21 @@ class IntentionGPT_v0(nn.Module):
             x_s = self.transformer_state_enc.wte(idx) 
             for block_s in self.transformer_state_enc.h:
                 x_s = block_s(x_s, cos, sin, mask, input_pos)
+                
+            x_t = self.transformer_action_enc.wte(idx) 
+            for block_a in self.transformer_action_enc.h:
+                x_t = block_a(x_t, cos, sin, mask, input_pos)    
+            x_t[:, :-1] = x_t[:, 1:]
+            mean_t, logvar_t = self.mean_layer(x_t), self.logvar_layer(x_t)
             
             x_a = self.transformer_bc.wte(idx) 
             for block_a in self.transformer_bc.h:
                 x_a = block_a(x_a, cos, sin, mask, input_pos)
             mean, logvar = self.mean_layer(x_a), self.logvar_layer(x_a)
-            action = self.reparameterization(mean, logvar)
+            if not train_mode:
+                action = mean
+            else:
+                action = self.reparameterization(mean, logvar)
             if action_only:
                 return action
             
@@ -302,20 +323,22 @@ class IntentionGPT_v0(nn.Module):
         
         ent = 0.5 * torch.log(2 * torch.pi * torch.e * torch.exp(logvar))
         return x, {"mean": mean, 
-                                 "logvar": logvar, 
-                                 "z": action, 
-                                 "entropy_mean": ent.mean(), 
-                                 "entropy_std": ent.std(), 
-                                 "entropy_max": ent.max(dim=-1)[0].mean(), 
-                                 "entropy_min": ent.min(dim=-1)[0].mean(),
-                                 "mean_mean": mean.mean(), 
-                                 "mean_std": mean.std(), 
-                                 "mean_max": mean.max(dim=-1)[0].mean(), 
-                                 "mean_min": mean.min(dim=-1)[0].mean(),
-                                 "std_mean": torch.exp(0.5 * logvar).mean(), 
-                                 "std_std": torch.exp(0.5 * logvar).std(), 
-                                 "std_max": torch.exp(0.5 * logvar).max(dim=-1)[0].mean(), 
-                                 "std_min": torch.exp(0.5 * logvar).min(dim=-1)[0].mean(),}  # (b, t, vocab_size)
+                    "logvar": logvar, 
+                    "mean_tar": mean if mean_t is None else mean_t, 
+                    "logvar_tar": logvar if logvar_t is None else logvar_t, 
+                    "z": action, 
+                    "entropy_mean": ent.mean(), 
+                    "entropy_std": ent.std(), 
+                    "entropy_max": ent.max(dim=-1)[0].mean(), 
+                    "entropy_min": ent.min(dim=-1)[0].mean(),
+                    "mean_mean": mean.mean(), 
+                    "mean_std": mean.std(), 
+                    "mean_max": mean.max(dim=-1)[0].mean(), 
+                    "mean_min": mean.min(dim=-1)[0].mean(),
+                    "std_mean": torch.exp(0.5 * logvar).mean(), 
+                    "std_std": torch.exp(0.5 * logvar).std(), 
+                    "std_max": torch.exp(0.5 * logvar).max(dim=-1)[0].mean(), 
+                    "std_min": torch.exp(0.5 * logvar).min(dim=-1)[0].mean(),}  # (b, t, vocab_size)
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -342,8 +365,14 @@ class IntentionGPT_v0(nn.Module):
         max_seq_length = self.max_seq_length
 
         # initialize the kv cache for all blocks
-        for block_e, block_d in zip(self.transformer_enc.h, self.transformer_dec.h):
-            block_e.attn.kv_cache = block_e.attn.build_kv_cache(
+        for block_b, block_s, block_a, block_d in zip(self.transformer_bc.h, self.transformer_state_enc.h, self.transformer_action_enc.h, self.transformer_dec.h):
+            block_b.attn.kv_cache = block_b.attn.build_kv_cache(
+                batch_size, max_seq_length, rope_cache_length, device, dtype
+            )
+            block_s.attn.kv_cache = block_s.attn.build_kv_cache(
+                batch_size, max_seq_length, rope_cache_length, device, dtype
+            )
+            block_a.attn.kv_cache = block_a.attn.build_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype
             )
             block_d.attn.kv_cache = block_d.attn.build_kv_cache(
@@ -915,9 +944,9 @@ class IntentionGPT(nn.Module):
     
     def reparameterization(self, mean, logvar):
         std = torch.exp(0.5 * logvar)
-        epsilon = torch.randn_like(std).clip(-3., 3.)
+        epsilon = torch.randn_like(std)
         z = mean + std*epsilon
-        # z = z.clamp(self.action_range[0], self.action_range[1])
+        z = z.clamp(self.action_range[0], self.action_range[1])
         return z
     
     def forward(self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, train_mode=False, action_copy=False, action_only=False, action_bias=None, action_mask_ratio=0.0) -> torch.Tensor:

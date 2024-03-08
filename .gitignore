@@ -12,6 +12,7 @@ data
 datasets
 checkpoints
 out
+out_history
 wandb
 events.out.tfevents*
 

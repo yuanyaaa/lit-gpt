@@ -69,7 +69,8 @@ hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str))
 def setup(resume: Union[bool, Path] = False):
     logger = choose_logger(logger_name, name=name, resume=resume)
 
-    strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+    # strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
+    strategy = FSDPStrategy(auto_wrap_policy={Block}, cpu_offload=False, limit_all_gathers=True, activation_checkpointing_policy={Block}, state_dict_type="full", sharding_strategy="FULL_SHARD")
     fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-mixed", loggers=[logger])
     fabric.launch()
 
@@ -275,38 +276,38 @@ def create_dataloaders(batch_size: int, block_size: int, num_workers: int = 8) -
     # Increase by one because we need the next word as well
     effective_block_size = block_size + 1
 
-    # train_datasets = [
-    #     StreamingDataset(
-    #         input_dir="data/slimpajama/train",
-    #         item_loader=TokensLoader(block_size=effective_block_size),
-    #         shuffle=True,
-    #         drop_last=True,
-    #     ),
-    #     StreamingDataset(
-    #         input_dir="data/starcoder",
-    #         item_loader=TokensLoader(block_size=effective_block_size),
-    #         shuffle=True,
-    #         drop_last=True,
-    #     ),
-    # ]
-    train_datasets = StreamingDataset(
-        # input_dir="/data/wangpy/Research/data/starcoder",
-        input_dir="/data/scz3286/lit-gpt/data/starcoder",
-        item_loader=TokensLoader(block_size=effective_block_size),
-        shuffle=True,
-        drop_last=True,
-    )
+    train_datasets = [
+        StreamingDataset(
+            input_dir="/data/scz3286/lit-gpt/data/slimpajama/train",
+            item_loader=TokensLoader(block_size=effective_block_size),
+            shuffle=True,
+            drop_last=True,
+        ),
+        StreamingDataset(
+            input_dir="/data/scz3286/lit-gpt/data/starcoder",
+            item_loader=TokensLoader(block_size=effective_block_size),
+            shuffle=True,
+            drop_last=True,
+        ),
+    ]
+    # train_datasets = StreamingDataset(
+    #     # input_dir="/data/wangpy/Research/data/starcoder",
+    #     input_dir="/data/scz3286/lit-gpt/data/starcoder",
+    #     item_loader=TokensLoader(block_size=effective_block_size),
+    #     shuffle=True,
+    #     drop_last=True,
+    # )
 
     # Mix SlimPajama data and Starcoder data with these proportions:
-    # weights = (0.693584, 0.306416)
-    # combined_dataset = CombinedStreamingDataset(datasets=train_datasets, seed=42, weights=weights)
+    weights = (0.693584, 0.306416)
+    combined_dataset = CombinedStreamingDataset(datasets=train_datasets, seed=42, weights=weights)
     train_dataloader = StreamingDataLoader(
-        train_datasets, batch_size=batch_size, pin_memory=True, num_workers=num_workers, drop_last=True
+        combined_dataset, batch_size=batch_size, pin_memory=True, num_workers=num_workers, drop_last=True
     )
 
     val_dataset = StreamingDataset(
         # input_dir="/data/wangpy/Research/data/starcoder_eval",
-        input_dir="/data/scz3286/lit-gpt/data/starcoder_eval",
+        input_dir="/data/scz3286/lit-gpt/data/slimpajama/validation",
         item_loader=TokensLoader(block_size=effective_block_size),
         shuffle=True,
         # Consider setting to False, but we would lose some samples due to truncation when world size > 1

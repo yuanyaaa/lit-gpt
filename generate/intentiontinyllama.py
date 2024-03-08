@@ -192,9 +192,9 @@ def main(fabric, resume):
         
         random_encoded = torch.randint_like(encoded.int(), 32000).long()
         mask = (torch.rand_like(encoded.float()) > 0.90).long()
-        encoded = (encoded * (1 - mask) + random_encoded * mask).contiguous().long()
+        input_encoded = (encoded * (1 - mask) + random_encoded * mask).contiguous().long()
         
-        y = next_token(model, 0, encoded.view(1, -1), action_bias=0.0, temperature=0.8, top_k=200)
+        y = next_token(model, 0, input_encoded.view(1, -1), action_bias=0.0, temperature=0.8, top_k=200)
         
         t = time.perf_counter() - t0
         sentence = tokenizer.decode(y)

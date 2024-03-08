@@ -38,7 +38,7 @@ def chunked_bc(
     return F.mse_loss(mean.detach(), mean_bc) + F.mse_loss(logvar.detach(), logvar_bc)
 
 
-def chunked_kl_time(
+def chunked_cross_entropy_time(
     mean: Union[torch.Tensor, List[torch.Tensor]],
     logvar: Union[torch.Tensor, List[torch.Tensor]],
     chunk_size: int = 0,
@@ -51,13 +51,33 @@ def chunked_kl_time(
     
     # no chunking at all
     mean = mean.reshape(-1, mean.size(-1))
-    logvar = logvar.reshape(-1, logvar.size(-1))
+    logvar = logvar.reshape(-1, logvar.size(-1)).detach()
     
     mean_ = mean_.reshape(-1, mean_.size(-1))
-    logvar_ = logvar_.reshape(-1, logvar_.size(-1))
+    logvar_ = logvar_.reshape(-1, logvar_.size(-1)).detach()
     
-    kld = 0.5 * (logvar_ - logvar + (torch.exp(logvar) + (mean - mean_)**2) / torch.exp(logvar_) - 1)
+    cross_entropy = 0.5 * (torch.log(2 * torch.pi * torch.exp(logvar_)) + (torch.exp(logvar) + (mean - mean_)**2) / torch.exp(logvar_) - 1)
+    return cross_entropy.mean()
+
+
+def chunked_tar_kld(
+    mean: Union[torch.Tensor, List[torch.Tensor]],
+    logvar: Union[torch.Tensor, List[torch.Tensor]],
+    mean_tar: Union[torch.Tensor, List[torch.Tensor]] = None,
+    logvar_tar: Union[torch.Tensor, List[torch.Tensor]] = None,
+    chunk_size: int = 0,
+    ignore_index: int = -1,
+) -> torch.Tensor:
+    # no chunking at all
+    mean = mean.reshape(-1, mean.size(-1))
+    logvar = logvar.reshape(-1, logvar.size(-1))
+    
+    mean_tar = mean_tar.reshape(-1, mean.size(-1))
+    logvar_tar = logvar_tar.reshape(-1, logvar.size(-1))
+    
+    kld = 0.5 * (logvar_tar - logvar + (torch.exp(logvar) + (mean - mean_tar)**2) / (torch.exp(logvar_tar)) - 1)
     return kld.mean()
+
 
  
 def chunked_kld(
